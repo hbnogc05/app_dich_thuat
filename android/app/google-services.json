@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "621700551720",
+    "project_id": "app-dich-thuat-7a5af",
+    "storage_bucket": "app-dich-thuat-7a5af.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:621700551720:android:64f4bbd0ff8d6e3828111d",
+        "android_client_info": {
+          "package_name": "com.example.app_dich_thuat"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBIk8JNptfvTU25E9ivSJrQzIJjBK-7Jcw"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
