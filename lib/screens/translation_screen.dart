@@ -1,7 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:record/record.dart';
 import '../services/auth_service.dart';
-import 'one_way_translation_screen.dart';
+import 'two_way_translation_screen.dart';
 
 class TranslationScreen extends StatefulWidget {
   const TranslationScreen({super.key});
@@ -13,26 +14,171 @@ class TranslationScreen extends StatefulWidget {
 class _TranslationScreenState extends State<TranslationScreen> {
   final AuthService _auth = AuthService();
   final User? currentUser = FirebaseAuth.instance.currentUser;
+  
+  // 0: Dashboard, 1: Two-way, 6: History
   int _selectedIndex = 0;
+  int _previousIndex = 0;
+
+  final GlobalKey<TwoWayTranslationScreenState> _twoWayKey = GlobalKey<TwoWayTranslationScreenState>();
+
+  final List<String> _historyItems = [];
+  InputDevice? _selectedInputDevice;
+
+  void _goToHistory() {
+    setState(() {
+      if (_selectedIndex != 6) {
+        _previousIndex = _selectedIndex;
+      }
+      _selectedIndex = 6;
+    });
+  }
+
+  void _goBackFromHistory() {
+    setState(() {
+      _selectedIndex = _previousIndex;
+    });
+  }
+
+  void _handleNewChat() {
+    if (_selectedIndex != 1) {
+      setState(() {
+        _selectedIndex = 1;
+      });
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final summary = _twoWayKey.currentState?.currentConversationSummary ?? "";
+      if (summary.isNotEmpty) _addToHistory(summary);
+      _twoWayKey.currentState?.resetChat();
+    });
+
+    ScaffoldMessenger.of(context).clearSnackBars();
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Đã bắt đầu cuộc trò chuyện mới'),
+        behavior: SnackBarBehavior.floating,
+        duration: Duration(seconds: 2),
+      ),
+    );
+  }
+
+  void _addToHistory(String text) {
+    if (text.isEmpty) return;
+    setState(() {
+      String summary = text.length > 40 ? "${text.substring(0, 40)}..." : text;
+      if (!_historyItems.contains(summary)) {
+        _historyItems.insert(0, summary);
+      }
+    });
+  }
+
+  void _loadFromHistory(String summary) {
+    setState(() {
+      _selectedIndex = 1;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _twoWayKey.currentState?.loadConversation(summary);
+    });
+  }
+
+  Future<void> _showAudioSettings() async {
+    final twoWayState = _twoWayKey.currentState;
+    if (twoWayState == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Vui lòng mở trang Dịch hai chiều trước để tải thiết bị.'))
+      );
+      return;
+    }
+
+    showDialog(
+      context: context,
+      builder: (context) => FutureBuilder<List<InputDevice>>(
+        future: twoWayState.getAvailableInputDevices(),
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting) {
+            return const AlertDialog(
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  CircularProgressIndicator(),
+                  SizedBox(height: 16),
+                  Text('Đang tải danh sách thiết bị...'),
+                ],
+              ),
+            );
+          }
+
+          final devices = snapshot.data ?? [];
+          return AlertDialog(
+            title: const Row(
+              children: [
+                Icon(Icons.settings_voice, color: Color(0xFF03A9F4)),
+                SizedBox(width: 10),
+                Text('Cài đặt âm thanh'),
+              ],
+            ),
+            content: SizedBox(
+              width: double.maxFinite,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('Thiết bị thu âm (Microphone):', style: TextStyle(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 8),
+                  if (devices.isEmpty)
+                    const Text('Không tìm thấy thiết bị nào hoặc chưa cấp quyền.', style: TextStyle(color: Colors.red, fontSize: 12))
+                  else
+                    DropdownButtonFormField<InputDevice>(
+                      isExpanded: true,
+                      value: _selectedInputDevice,
+                      hint: const Text('Chọn microphone'),
+                      items: devices.map((d) => DropdownMenuItem(
+                        value: d,
+                        child: Text(d.label, overflow: TextOverflow.ellipsis),
+                      )).toList(),
+                      onChanged: (val) {
+                        if (val != null) {
+                          setState(() => _selectedInputDevice = val);
+                          twoWayState.setInputDevice(val);
+                        }
+                      },
+                    ),
+                  const SizedBox(height: 20),
+                  const Text('Thiết bị phát âm (Speaker):', style: TextStyle(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 8),
+                  const Text('Sử dụng thiết bị đầu ra mặc định của hệ thống.', style: TextStyle(color: Colors.grey, fontSize: 12)),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(context), child: const Text('Đóng')),
+            ],
+          );
+        },
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     const Color primaryBlue = Color(0xFF03A9F4);
     
-    // Hàm lấy chữ cái đầu an toàn tuyệt đối
     String getInitial() {
       String name = currentUser?.displayName ?? '';
       if (name.trim().isEmpty) name = currentUser?.email ?? '';
       if (name.trim().isEmpty) return 'U';
-      String trimmed = name.trim();
-      return trimmed.isNotEmpty ? trimmed[0].toUpperCase() : 'U';
+      return name.trim()[0].toUpperCase();
     }
+
+    int stackIndex = 0;
+    if (_selectedIndex == 1) stackIndex = 1;
+    else if (_selectedIndex == 6) stackIndex = 2;
 
     return Scaffold(
       backgroundColor: Colors.white,
       body: Row(
         children: [
-          // 1. Sidebar (Menu bên trái)
+          // Sidebar
           Container(
             width: 280,
             decoration: BoxDecoration(
@@ -42,7 +188,6 @@ class _TranslationScreenState extends State<TranslationScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                // Logo Section
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 30),
                   child: Row(
@@ -56,26 +201,63 @@ class _TranslationScreenState extends State<TranslationScreen> {
                         child: const Icon(Icons.flash_on, color: Colors.white, size: 20),
                       ),
                       const SizedBox(width: 12),
-                      const Text(
-                        'GoTrans',
-                        style: TextStyle(
-                          fontSize: 22,
-                          fontWeight: FontWeight.w900,
-                          color: Color(0xFF1E293B),
-                          letterSpacing: -0.5,
+                      GestureDetector(
+                        onTap: () => setState(() => _selectedIndex = 0),
+                        child: const Text(
+                          'GoTrans',
+                          style: TextStyle(
+                            fontSize: 22,
+                            fontWeight: FontWeight.w900,
+                            color: Color(0xFF1E293B),
+                            letterSpacing: -0.5,
+                          ),
                         ),
                       ),
-                      const Spacer(),
-                      Icon(Icons.keyboard_tab, color: Colors.grey.shade400, size: 20),
                     ],
                   ),
                 ),
+
+                // New Chat Button in Sidebar
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  child: Material(
+                    color: Colors.transparent,
+                    child: InkWell(
+                      onTap: _handleNewChat,
+                      borderRadius: BorderRadius.circular(12),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                        decoration: BoxDecoration(
+                          border: Border.all(color: primaryBlue.withValues(alpha: 0.3)),
+                          borderRadius: BorderRadius.circular(12),
+                          color: primaryBlue.withValues(alpha: 0.05),
+                        ),
+                        child: const Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(Icons.add, color: primaryBlue, size: 20),
+                            SizedBox(width: 8),
+                            Text(
+                              'Cuộc trò chuyện mới',
+                              style: TextStyle(
+                                color: primaryBlue,
+                                fontWeight: FontWeight.bold,
+                                fontSize: 14,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+
+                const SizedBox(height: 12),
                 
-                // Menu List
                 SidebarItem(
                   index: 0,
                   icon: Icons.chat_bubble_outline,
-                  title: 'Dịch một chiều',
+                  title: 'Trang chủ',
                   isActive: _selectedIndex == 0,
                   onTap: () => setState(() => _selectedIndex = 0),
                 ),
@@ -86,99 +268,63 @@ class _TranslationScreenState extends State<TranslationScreen> {
                   isActive: _selectedIndex == 1,
                   onTap: () => setState(() => _selectedIndex = 1),
                 ),
-                SidebarItem(
-                  index: 2,
-                  icon: Icons.mic_none,
-                  title: 'Phiên âm',
-                  isActive: _selectedIndex == 2,
-                  onTap: () => setState(() => _selectedIndex = 2),
-                ),
-                SidebarItem(
-                  index: 3,
-                  icon: Icons.event_available_outlined,
-                  title: 'Chế độ sự kiện',
-                  isActive: _selectedIndex == 3,
-                  hasBadge: true,
-                  onTap: () => setState(() => _selectedIndex = 3),
-                ),
+                SidebarItem(index: 3, icon: Icons.mic_none, title: 'Phiên âm', isActive: _selectedIndex == 3, onTap: () {}),
+                SidebarItem(index: 4, icon: Icons.event_available_outlined, title: 'Chế độ sự kiện', isActive: _selectedIndex == 4, hasBadge: true, onTap: () {}),
                 
                 const SizedBox(height: 20),
+                SidebarItem(index: 5, icon: Icons.search, title: 'Tìm kiếm', isActive: _selectedIndex == 5, onTap: () {}),
                 SidebarItem(
-                  index: 4,
-                  icon: Icons.search,
-                  title: 'Tìm kiếm',
-                  isActive: _selectedIndex == 4,
-                  onTap: () => setState(() => _selectedIndex = 4),
-                ),
-                SidebarItem(
-                  index: 5,
+                  index: 6,
                   icon: Icons.history,
                   title: 'Lịch sử',
-                  isActive: _selectedIndex == 5,
-                  onTap: () => setState(() => _selectedIndex = 5),
+                  isActive: _selectedIndex == 6,
+                  onTap: _goToHistory,
                 ),
+
+                // Recent History List in Sidebar
+                if (_historyItems.isNotEmpty) ...[
+                  const Padding(
+                    padding: EdgeInsets.fromLTRB(28, 16, 16, 8),
+                    child: Text(
+                      'LỊCH SỬ GẦN ĐÂY',
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.bold,
+                        color: Color(0xFF94A3B8),
+                        letterSpacing: 1.0,
+                      ),
+                    ),
+                  ),
+                  ..._historyItems.take(3).map((item) => Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 2),
+                    child: InkWell(
+                      onTap: () => _loadFromHistory(item),
+                      borderRadius: BorderRadius.circular(8),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                        child: Row(
+                          children: [
+                            const Icon(Icons.history, size: 14, color: Color(0xFF64748B)),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                item,
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  color: Color(0xFF64748B),
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  )),
+                ],
                 
                 const Spacer(),
                 
-                // Promo Card (Blue Theme)
-                Padding(
-                  padding: const EdgeInsets.all(16.0),
-                  child: Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.all(16),
-                    decoration: BoxDecoration(
-                      gradient: LinearGradient(
-                        colors: [primaryBlue.withOpacity(0.7), primaryBlue],
-                        begin: Alignment.topLeft,
-                        end: Alignment.bottomRight,
-                      ),
-                      borderRadius: BorderRadius.circular(20),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text(
-                          'Mới trên GoTrans',
-                          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 13),
-                        ),
-                        const SizedBox(height: 4),
-                        const Text(
-                          'Dịch giọng nói nhanh hơn, chính xác hơn',
-                          style: TextStyle(color: Colors.white70, fontSize: 10),
-                        ),
-                        const SizedBox(height: 12),
-                        const Text(
-                          'GoTransVoice',
-                          style: TextStyle(color: Colors.white, fontWeight: FontWeight.w900, fontSize: 14),
-                        ),
-                        const Text(
-                          'Chuyển văn bản thành giọng nói & nhân bản giọng AI...',
-                          style: TextStyle(color: Colors.white70, fontSize: 10),
-                        ),
-                        const SizedBox(height: 12),
-                        InkWell(
-                          onTap: () {},
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(vertical: 8),
-                            width: double.infinity,
-                            decoration: BoxDecoration(
-                              color: Colors.white.withOpacity(0.2),
-                              borderRadius: BorderRadius.circular(12),
-                            ),
-                            child: const Center(
-                              child: Text(
-                                'Truy cập GoTransVoice →',
-                                style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11),
-                              ),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-                
-                // User Profile Section
                 const Divider(height: 1),
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
@@ -187,10 +333,7 @@ class _TranslationScreenState extends State<TranslationScreen> {
                       CircleAvatar(
                         backgroundColor: const Color(0xFF94A3B8),
                         radius: 20,
-                        child: Text(
-                          getInitial(),
-                          style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
-                        ),
+                        child: Text(getInitial(), style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
                       ),
                       const SizedBox(width: 12),
                       Expanded(
@@ -198,121 +341,111 @@ class _TranslationScreenState extends State<TranslationScreen> {
                           crossAxisAlignment: CrossAxisAlignment.start,
                           mainAxisSize: MainAxisSize.min,
                           children: [
-                            Row(
-                              children: [
-                                Text(
-                                  currentUser?.displayName ?? 'Người dùng',
-                                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
-                                ),
-                                const SizedBox(width: 4),
-                                Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
-                                  decoration: BoxDecoration(
-                                    color: Colors.grey.shade200,
-                                    borderRadius: BorderRadius.circular(4),
-                                  ),
-                                  child: const Text('Gói Miễn phí', style: TextStyle(fontSize: 9, color: Colors.grey)),
-                                ),
-                              ],
-                            ),
-                            Text(
-                              currentUser?.email ?? '',
-                              style: TextStyle(fontSize: 11, color: Colors.grey.shade500),
-                              overflow: TextOverflow.ellipsis,
-                            ),
+                            Text(currentUser?.displayName ?? 'Người dùng', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                            Text(currentUser?.email ?? '', style: TextStyle(fontSize: 11, color: Colors.grey.shade500), overflow: TextOverflow.ellipsis),
                           ],
                         ),
                       ),
                       IconButton(
+                        icon: const Icon(Icons.settings, size: 18, color: Colors.grey),
+                        onPressed: _showAudioSettings,
+                        tooltip: 'Cài đặt âm thanh',
+                      ),
+                      IconButton(
                         icon: const Icon(Icons.logout, size: 18, color: Colors.grey),
                         onPressed: () async => await _auth.signOut(),
+                        tooltip: 'Đăng xuất',
                       ),
                     ],
                   ),
-                ),
-                const Padding(
-                  padding: EdgeInsets.only(left: 16, bottom: 20),
-                  child: Text('Sản phẩm đến từ GoTrans', style: TextStyle(fontSize: 10, color: Colors.grey)),
                 ),
               ],
             ),
           ),
           
-          // 2. Main Content
+          // Content
           Expanded(
-            child: Container(
-              color: Colors.white,
-              child: Center(
-                child: SingleChildScrollView(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      const Text(
-                        'Bạn muốn tạo gì hôm nay?',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          fontSize: 48,
-                          fontWeight: FontWeight.w900,
-                          color: Color(0xFF1E293B),
-                          letterSpacing: -1.5,
-                        ),
-                      ),
-                      const SizedBox(height: 16),
-                      const Text(
-                        'AI giọng nói đa ngôn ngữ theo thời gian thực cho mục đích sử dụng hàng ngày',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(fontSize: 20, color: Color(0xFF64748B)),
-                      ),
-                      const SizedBox(height: 80),
-                      
-                      // Feature Cards row
-                      Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 40),
-                        child: SingleChildScrollView(
-                          scrollDirection: Axis.horizontal,
-                          child: Row(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              FeatureCard(
-                                icon: Icons.translate,
-                                title: 'Dịch một chiều',
-                                desc: 'Dịch cho các hội nghị hoặc hội thảo để mọi người cùng có thể theo dõi',
-                                onTap: () {
-                                  Navigator.push(
-                                    context,
-                                    MaterialPageRoute(builder: (context) => const OneWayTranslationScreen()),
-                                  );
-                                },
-                              ),
-                              const SizedBox(width: 20),
-                              const FeatureCard(
-                                icon: Icons.swap_horiz,
-                                title: 'Dịch hai chiều',
-                                desc: 'Hoàn hảo cho các cuộc họp hoặc trò chuyện nhóm bằng nhiều ngôn ngữ',
-                              ),
-                              const SizedBox(width: 20),
-                              const FeatureCard(
-                                icon: Icons.mic_none,
-                                title: 'Phiên âm',
-                                desc: 'GoTrans ghi lại từ thuật ngữ kỹ thuật đến quyết định quan trọng trong một bản phiên âm',
-                              ),
-                              const SizedBox(width: 20),
-                              const FeatureCard(
-                                icon: Icons.event_note,
-                                title: 'Chế độ sự kiện',
-                                desc: 'Phát bài phát biểu của bạn cho nhiều người tham dự qua QR với phụ đề trực tiếp',
-                                isNew: true,
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 50),
-                    ],
-                  ),
+            child: IndexedStack(
+              index: stackIndex,
+              children: [
+                _buildDashboard(),
+                TwoWayTranslationScreen(
+                  key: _twoWayKey,
+                  onHistoryAdded: _addToHistory,
+                  onBack: () => setState(() => _selectedIndex = 0),
+                  onNewChat: _handleNewChat,
+                  onViewHistory: _goToHistory,
+                  onLoadFromHistory: _loadFromHistory,
+                  historyItems: _historyItems,
                 ),
-              ),
+                _buildHistoryScreen(),
+              ],
             ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildHistoryScreen() {
+    return Container(
+      color: Colors.white,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(40, 32, 40, 0),
+            child: Row(
+              children: [
+                IconButton(
+                  onPressed: _goBackFromHistory,
+                  icon: const Icon(Icons.arrow_back_ios_new, color: Color(0xFF64748B), size: 18),
+                  style: IconButton.styleFrom(backgroundColor: Colors.white, shape: const CircleBorder(), side: const BorderSide(color: Color(0xFFE2E8F0))),
+                ),
+                const SizedBox(width: 20),
+                const Text('Lịch sử dịch thuật', style: TextStyle(fontSize: 28, fontWeight: FontWeight.w900, color: Color(0xFF1E293B))),
+              ],
+            ),
+          ),
+          const SizedBox(height: 40),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 40),
+              child: _historyItems.isEmpty
+                  ? const Center(child: Text('Chưa có lịch sử nào'))
+                  : ListView.builder(
+                      itemCount: _historyItems.length,
+                      itemBuilder: (context, index) {
+                        return ListTile(
+                          title: Text(_historyItems[index]),
+                          onTap: () => _loadFromHistory(_historyItems[index]),
+                        );
+                      },
+                    ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDashboard() {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const Text('Bạn muốn tạo gì hôm nay?', textAlign: TextAlign.center, style: TextStyle(fontSize: 48, fontWeight: FontWeight.w900, color: Color(0xFF1E293B))),
+          const SizedBox(height: 80),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              FeatureCard(
+                icon: Icons.swap_horiz,
+                title: 'Dịch hai chiều',
+                desc: 'Hoàn hảo cho các cuộc họp hoặc trò chuyện nhóm',
+                onTap: () => setState(() => _selectedIndex = 1),
+              ),
+            ],
           ),
         ],
       ),
@@ -328,15 +461,7 @@ class SidebarItem extends StatefulWidget {
   final bool hasBadge;
   final VoidCallback onTap;
 
-  const SidebarItem({
-    super.key,
-    required this.index,
-    required this.icon,
-    required this.title,
-    required this.isActive,
-    required this.onTap,
-    this.hasBadge = false,
-  });
+  const SidebarItem({super.key, required this.index, required this.icon, required this.title, required this.isActive, required this.onTap, this.hasBadge = false});
 
   @override
   State<SidebarItem> createState() => _SidebarItemState();
@@ -348,56 +473,25 @@ class _SidebarItemState extends State<SidebarItem> {
   @override
   Widget build(BuildContext context) {
     const Color primaryBlue = Color(0xFF03A9F4);
-    
     return MouseRegion(
       onEnter: (_) => setState(() => _isHovered = true),
       onExit: (_) => setState(() => _isHovered = false),
-      cursor: SystemMouseCursors.click,
       child: GestureDetector(
         onTap: widget.onTap,
         child: Container(
           margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 2),
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
           decoration: BoxDecoration(
-            // Màu xám nhạt khi trỏ chuột vào (F1F5F9 là xám nhạt của Tailwind)
-            color: widget.isActive 
-                ? Colors.white 
-                : (_isHovered ? const Color(0xFFF1F5F9) : Colors.transparent),
+            color: widget.isActive ? Colors.white : (_isHovered ? const Color(0xFFF1F5F9) : Colors.transparent),
             borderRadius: BorderRadius.circular(12),
-            boxShadow: widget.isActive 
-                ? [BoxShadow(color: Colors.black.withOpacity(0.04), blurRadius: 10, offset: const Offset(0, 4))] 
-                : null,
+            boxShadow: widget.isActive ? [BoxShadow(color: Colors.black.withValues(alpha: 0.04), blurRadius: 10, offset: const Offset(0, 4))] : null,
           ),
           child: Row(
             children: [
-              Icon(
-                widget.icon, 
-                color: widget.isActive ? primaryBlue : const Color(0xFF64748B), 
-                size: 22
-              ),
+              Icon(widget.icon, color: widget.isActive ? primaryBlue : const Color(0xFF64748B), size: 22),
               const SizedBox(width: 12),
-              Expanded(
-                child: Text(
-                  widget.title,
-                  style: TextStyle(
-                    color: widget.isActive ? const Color(0xFF1E293B) : const Color(0xFF64748B),
-                    fontWeight: widget.isActive ? FontWeight.bold : FontWeight.w500,
-                    fontSize: 14,
-                  ),
-                ),
-              ),
-              if (widget.hasBadge)
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                  decoration: BoxDecoration(
-                    color: primaryBlue.withOpacity(0.1), 
-                    borderRadius: BorderRadius.circular(8)
-                  ),
-                  child: const Text(
-                    'Mới', 
-                    style: TextStyle(color: primaryBlue, fontSize: 10, fontWeight: FontWeight.bold)
-                  ),
-                ),
+              Expanded(child: Text(widget.title, style: TextStyle(color: widget.isActive ? const Color(0xFF1E293B) : const Color(0xFF64748B), fontWeight: widget.isActive ? FontWeight.bold : FontWeight.w500, fontSize: 14))),
+              if (widget.hasBadge) Container(padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2), decoration: BoxDecoration(color: const Color(0xFFE1F5FE), borderRadius: BorderRadius.circular(8)), child: const Text('Mới', style: TextStyle(color: primaryBlue, fontSize: 10, fontWeight: FontWeight.bold))),
             ],
           ),
         ),
@@ -413,14 +507,7 @@ class FeatureCard extends StatefulWidget {
   final bool isNew;
   final VoidCallback? onTap;
 
-  const FeatureCard({
-    super.key,
-    required this.icon,
-    required this.title,
-    required this.desc,
-    this.isNew = false,
-    this.onTap,
-  });
+  const FeatureCard({super.key, required this.icon, required this.title, required this.desc, this.isNew = false, this.onTap});
 
   @override
   State<FeatureCard> createState() => _FeatureCardState();
@@ -432,108 +519,31 @@ class _FeatureCardState extends State<FeatureCard> {
   @override
   Widget build(BuildContext context) {
     const Color primaryBlue = Color(0xFF03A9F4);
-
     return MouseRegion(
       onEnter: (_) => setState(() => _isHovered = true),
       onExit: (_) => setState(() => _isHovered = false),
-      cursor: SystemMouseCursors.click,
       child: GestureDetector(
         onTap: widget.onTap,
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 300),
-          curve: Curves.easeOutCubic,
           width: 250,
           height: 280,
           padding: const EdgeInsets.all(32),
-          // Hiệu ứng đẩy ô lên nhẹ nhàng hơn và xoay nhẹ
-          transform: _isHovered 
-              ? (Matrix4.identity()
-                  ..translate(0, -8) // Giảm từ -15 xuống -8
-                  ..rotateZ(0.02))   // Giảm từ 0.05 xuống 0.02 (~1.1 độ)
-              : Matrix4.identity(),
-          transformAlignment: Alignment.center,
+          transform: _isHovered ? (Matrix4.translationValues(0, -10, 0)) : Matrix4.identity(),
           decoration: BoxDecoration(
             color: const Color(0xFFF9FBFC),
             borderRadius: BorderRadius.circular(32),
-            border: Border.all(
-              color: _isHovered ? primaryBlue.withOpacity(0.3) : Colors.grey.shade100,
-              width: 1,
-            ),
-            // Hiệu ứng màu thu gọn lại hơn ở góc trên bên phải
-            gradient: _isHovered
-                ? RadialGradient(
-                    center: const Alignment(1.2, -1.2), 
-                    radius: 0.6,
-                    colors: [
-                      primaryBlue.withOpacity(0.18),
-                      const Color(0xFFF9FBFC),
-                    ],
-                    stops: const [0.0, 1.0],
-                  )
-                : null,
-            boxShadow: _isHovered
-                ? [
-                    BoxShadow(
-                      color: primaryBlue.withOpacity(0.08),
-                      blurRadius: 20,
-                      offset: const Offset(0, 10),
-                    )
-                  ]
-                : null,
+            border: Border.all(color: _isHovered ? primaryBlue.withValues(alpha: 0.3) : Colors.grey.shade100, width: 1),
+            boxShadow: _isHovered ? [BoxShadow(color: primaryBlue.withValues(alpha: 0.08), blurRadius: 20, offset: const Offset(0, 10))] : null,
           ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  AnimatedContainer(
-                    duration: const Duration(milliseconds: 300),
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: _isHovered ? Colors.white : primaryBlue.withOpacity(0.1),
-                      borderRadius: BorderRadius.circular(14),
-                      boxShadow: _isHovered 
-                          ? [BoxShadow(color: primaryBlue.withOpacity(0.15), blurRadius: 8)] 
-                          : null,
-                    ),
-                    child: Icon(widget.icon, color: primaryBlue, size: 24),
-                  ),
-                  if (widget.isNew)
-                    Text(
-                      'Mới',
-                      style: TextStyle(
-                        color: _isHovered ? primaryBlue : Colors.grey.shade400,
-                        fontSize: 10,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                ],
-              ),
+              Icon(widget.icon, color: primaryBlue, size: 24),
               const SizedBox(height: 28),
-              Text(
-                widget.title,
-                style: const TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.w800,
-                  color: Color(0xFF1E293B),
-                ),
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
+              Text(widget.title, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800, color: Color(0xFF1E293B))),
               const SizedBox(height: 10),
-              Expanded(
-                child: Text(
-                  widget.desc,
-                  style: const TextStyle(
-                    fontSize: 13,
-                    color: Color(0xFF64748B),
-                    height: 1.5,
-                  ),
-                  maxLines: 4,
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ),
+              Text(widget.desc, style: const TextStyle(fontSize: 13, color: Color(0xFF64748B), height: 1.5), maxLines: 4, overflow: TextOverflow.ellipsis),
             ],
           ),
         ),

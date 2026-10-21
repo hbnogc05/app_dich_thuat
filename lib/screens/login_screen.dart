@@ -71,7 +71,7 @@ class _LoginScreenState extends State<LoginScreen> {
                     borderRadius: BorderRadius.circular(28),
                     boxShadow: [
                       BoxShadow(
-                        color: Colors.blue.withOpacity(0.08),
+                        color: Colors.blue.withValues(alpha: 0.08),
                         blurRadius: 30,
                         offset: const Offset(0, 15),
                       ),
@@ -93,7 +93,7 @@ class _LoginScreenState extends State<LoginScreen> {
                             borderRadius: BorderRadius.circular(16),
                             boxShadow: [
                               BoxShadow(
-                                color: primaryBlue.withOpacity(0.3),
+                                color: primaryBlue.withValues(alpha: 0.3),
                                 blurRadius: 10,
                                 offset: const Offset(0, 5),
                               )
@@ -129,27 +129,6 @@ class _LoginScreenState extends State<LoginScreen> {
                           icon: Icons.g_mobiledata, 
                           text: 'Tiếp tục với Google', 
                           isPrimary: true,
-                          onPressed: () async {
-                            dynamic result = await _auth.signInWithGoogle();
-                            if (result == null) {
-                              setState(() => error = 'Đăng nhập Google thất bại');
-                            } else {
-                              if (mounted) Navigator.pop(context);
-                            }
-                          },
-                        ),
-                        const SizedBox(height: 12),
-                        _socialButton(
-                          icon: Icons.facebook, 
-                          text: 'Tiếp tục với Facebook',
-                          onPressed: () async {
-                            dynamic result = await _auth.signInWithFacebook();
-                            if (result == null) {
-                              setState(() => error = 'Đăng nhập Facebook thất bại');
-                            } else {
-                              if (mounted) Navigator.pop(context);
-                            }
-                          },
                         ),
                         const SizedBox(height: 12),
                         _socialButton(
@@ -311,7 +290,7 @@ class _LoginScreenState extends State<LoginScreen> {
                   shape: BoxShape.circle,
                   boxShadow: [
                     BoxShadow(
-                      color: primaryBlue.withOpacity(0.3),
+                      color: primaryBlue.withValues(alpha: 0.3),
                       blurRadius: 15,
                       offset: const Offset(0, 8),
                     )
@@ -362,11 +341,11 @@ class _LoginScreenState extends State<LoginScreen> {
     );
   }
 
-  Widget _socialButton({required IconData icon, required String text, bool isPrimary = false, VoidCallback? onPressed}) {
+  Widget _socialButton({required IconData icon, required String text, bool isPrimary = false}) {
     return SizedBox(
       width: double.infinity,
       child: OutlinedButton.icon(
-        onPressed: onPressed ?? () {},
+        onPressed: () {},
         icon: Icon(icon, color: isPrimary ? Colors.white : const Color(0xFF1E293B)),
         label: Text(
           text,
