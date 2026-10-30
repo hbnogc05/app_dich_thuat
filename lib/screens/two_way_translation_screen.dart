@@ -32,6 +32,7 @@ class TwoWayTranslationScreen extends StatefulWidget {
   final VoidCallback? onNewChat;
   final VoidCallback? onViewHistory;
   final Function(String)? onLoadFromHistory;
+  final Function(bool isTwoWay)? onModeChanged;
   final List<String> historyItems;
 
   const TwoWayTranslationScreen({
@@ -41,6 +42,7 @@ class TwoWayTranslationScreen extends StatefulWidget {
     this.onNewChat,
     this.onViewHistory,
     this.onLoadFromHistory,
+    this.onModeChanged,
     this.historyItems = const [],
   });
 
@@ -197,14 +199,14 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
     _initGoTransEngine();
     _btnAnimController = AnimationController(
       vsync: this,
-      duration: const Duration(seconds: 3),
+      duration: const Duration(milliseconds: 2000),
     )..repeat();
   }
 
   void _initGoTransEngine() {
     _gotransEngine = GoTransCoreEngine(
-      vadThreshold: 15.0,
-      silenceDurationMs: 750,       // Nhạy bén chốt câu ngay khi bạn bấm dừng video (750ms)
+      vadThreshold: 11.0,
+      silenceDurationMs: 850,
       speakerSwitchSilenceMs: 2600,
       autoDiarization: true,
       maxSpeakers: _availableSpeakerColors.length,
@@ -226,9 +228,7 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
         });
         _scrollToBottom();
       },
-      // QUAN TRỌNG: Không dùng `if (_isPaused) return;` ở đây để khi vừa bấm Pause,
-      // câu đang dịch dở vẫn được đẩy vào danh sách kết quả mà không bị mất chữ!
-      onFinalSentence: (finalOriginal, finalTranslation, speakerId, latency) async {
+      onFinalSentence: (finalOriginal, finalTranslation, speakerId, sourceLang, targetLang, latency) async {
         if (!mounted) return;
 
         String timestamp = _formatDuration(_recordDuration);
@@ -238,12 +238,10 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
           _segments.add(TranslationSegment(
             speakerId: sId,
             originalText: finalOriginal,
-            translatedText: finalTranslation,
+            translatedText: finalTranslation, // Nếu nói trùng ngôn ngữ đích ở chế độ Tự động, cột này giữ nguyên văn bản!
             timestamp: timestamp,
-            sourceLanguage: _sourceLang == 'Tự động'
-                ? (_gotransEngine.currentSourceLocale.startsWith('vi') ? 'Việt' : 'Anh')
-                : _sourceLang,
-            targetLanguage: _targetLang,
+            sourceLanguage: sourceLang,
+            targetLanguage: targetLang,
             speakerColor: _getSpeakerColor(sId),
           ));
           _liveSourceText = "";
@@ -257,10 +255,10 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
         }
 
         if (_sourceTtsEnabled) {
-          await _gotransEngine.speakNative(finalOriginal, targetLanguage: _gotransEngine.currentSourceLocale);
+          await _gotransEngine.speakNative(finalOriginal, targetLanguage: sourceLang);
         }
         if (_targetTtsEnabled) {
-          await _gotransEngine.speakNative(finalTranslation, targetLanguage: _gotransEngine.currentTargetLang);
+          await _gotransEngine.speakNative(finalTranslation, targetLanguage: targetLang);
         }
       },
       onError: (msg) {
@@ -356,7 +354,11 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
     }
     try {
       String localeId = _langToLocale[_sourceLang] ?? 'auto';
-      final started = await _gotransEngine.startRecording(sourceLocaleId: localeId, targetLanguage: _targetLang);
+      final started = await _gotransEngine.startRecording(
+        sourceLocaleId: localeId,
+        targetLanguage: _targetLang,
+        sourceLangName: _sourceLang,
+      );
       if (mounted) {
         setState(() {
           _isStarting = false;
@@ -388,8 +390,6 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
     });
   }
 
-  /// Khi bấm nút Pause/Resume trên thanh điều khiển:
-  /// Chốt ngay các chữ đang treo trước khi tạm dừng để không bị mất chữ
   Future<void> _togglePause() async {
     final bool nextPauseState = !_isPaused;
     setState(() {
@@ -462,6 +462,7 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
   }
 
   Widget _buildHeader() {
+    final String title = _sourceLang == 'Tự động' ? 'Dịch một chiều' : 'Dịch 2 chiều';
     return Padding(
       padding: const EdgeInsets.fromLTRB(24, 16, 24, 8),
       child: Row(
@@ -474,7 +475,7 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
               constraints: const BoxConstraints(),
             ),
           const SizedBox(width: 8),
-          const Text('Dịch hai chiều', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: textDark)),
+          Text(title, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: textDark)),
           const Spacer(),
         ],
       ),
@@ -545,6 +546,7 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
               } else {
                 _targetLang = lang;
               }
+              widget.onModeChanged?.call(_sourceLang != 'Tự động');
               resetChat();
             });
           },
@@ -622,20 +624,7 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                if (!isEmpty)
-                  IconButton(
-                    onPressed: () {
-                      final text = isLeft
-                          ? _segments.map((s) => s.originalText).join(". ")
-                          : _segments.map((s) => s.translatedText).join(". ");
-                      final lang = isLeft ? _gotransEngine.currentSourceLocale : _gotransEngine.currentTargetLang;
-                      _gotransEngine.speakNative(text, targetLanguage: lang);
-                    },
-                    icon: Icon(Icons.play_circle_outline, color: isVoiceEnabled ? blueAccent : textLight, size: 22),
-                    tooltip: 'Nghe lại',
-                  )
-                else
-                  const SizedBox(width: 44),
+                const SizedBox(width: 44),
                 InkWell(
                   onTap: () => setState(() {
                     if (isLeft) {
@@ -769,11 +758,12 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
   }
 
   Widget _buildHowItWorks() {
+    final String modeText = _sourceLang == 'Tự động' ? 'một chiều' : '2 chiều';
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
       children: [
-        const Text('How It Works?', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: textDark)),
+        Text('Cách hoạt động ($modeText)', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: textDark)),
         const SizedBox(height: 20),
         _buildHowItWorksStep(
           1,
@@ -784,8 +774,10 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
         const SizedBox(height: 16),
         _buildHowItWorksStep(
           2,
-          'Tự động nhận diện giọng nói',
-          'Chỉ cần bắt đầu nói. Hệ thống tự động phân tách nhiều người nói (Speaker 01, 02, 03...) theo thời gian thực.',
+          _sourceLang == 'Tự động' ? 'Tự động nhận diện ngôn ngữ & người nói' : 'Dịch song phương',
+          _sourceLang == 'Tự động'
+              ? 'Nếu bạn nói ngôn ngữ khác ngôn ngữ đích, hệ thống sẽ tự động dịch. Nếu bạn nói cùng ngôn ngữ đích, văn bản sẽ được giữ nguyên.'
+              : 'Nói bất kỳ ngôn ngữ nào trong hai ngôn ngữ đã chọn. Hệ thống sẽ tự động chuyển đổi ngôn ngữ đích.',
         ),
         const SizedBox(height: 16),
         _buildHowItWorksStep(
@@ -852,22 +844,17 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
                   padding: const EdgeInsets.symmetric(horizontal: 48, vertical: 12),
                   decoration: BoxDecoration(
                     gradient: LinearGradient(
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
+                      begin: Alignment(offset * 2 - 1, -1),
+                      end: Alignment(offset * 2 + 1, 1),
+                      tileMode: TileMode.repeated,
                       colors: [
                         speakerColor,
-                        speakerColor.withOpacity(0.7),
-                        speakerColor.withOpacity(0.4),
-                        speakerColor.withOpacity(0.7),
+                        speakerColor.withOpacity(0.8),
+                        speakerColor.withOpacity(0.5),
+                        speakerColor.withOpacity(0.8),
                         speakerColor,
                       ],
-                      stops: [
-                        0.0,
-                        (offset - 0.2).clamp(0.0, 1.0),
-                        offset,
-                        (offset + 0.2).clamp(0.0, 1.0),
-                        1.0
-                      ],
+                      stops: const [0.0, 0.25, 0.5, 0.75, 1.0],
                     ),
                     borderRadius: BorderRadius.circular(12),
                     boxShadow: [

@@ -15,9 +15,10 @@ class _TranslationScreenState extends State<TranslationScreen> {
   final AuthService _auth = AuthService();
   final User? currentUser = FirebaseAuth.instance.currentUser;
   
-  // 0: Dashboard, 1: Two-way, 6: History
+  // 0: Dashboard, 1: Translation, 6: History
   int _selectedIndex = 0;
   int _previousIndex = 0;
+  bool _isTwoWayMode = false; // Mặc định là một chiều vì sourceLang là Tự động
 
   final GlobalKey<TwoWayTranslationScreenState> _twoWayKey = GlobalKey<TwoWayTranslationScreenState>();
 
@@ -85,7 +86,7 @@ class _TranslationScreenState extends State<TranslationScreen> {
     final twoWayState = _twoWayKey.currentState;
     if (twoWayState == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Vui lòng mở trang Dịch hai chiều trước để tải thiết bị.'))
+        SnackBar(content: Text('Vui lòng mở trang ${_isTwoWayMode ? "Dịch 2 chiều" : "Dịch một chiều"} trước để tải thiết bị.'))
       );
       return;
     }
@@ -162,6 +163,7 @@ class _TranslationScreenState extends State<TranslationScreen> {
   @override
   Widget build(BuildContext context) {
     const Color primaryBlue = Color(0xFF03A9F4);
+    final String translationModeTitle = _isTwoWayMode ? 'Dịch 2 chiều' : 'Dịch một chiều';
     
     String getInitial() {
       String name = currentUser?.displayName ?? '';
@@ -171,8 +173,11 @@ class _TranslationScreenState extends State<TranslationScreen> {
     }
 
     int stackIndex = 0;
-    if (_selectedIndex == 1) stackIndex = 1;
-    else if (_selectedIndex == 6) stackIndex = 2;
+    if (_selectedIndex == 1) {
+      stackIndex = 1;
+    } else if (_selectedIndex == 6) {
+      stackIndex = 2;
+    }
 
     return Scaffold(
       backgroundColor: Colors.white,
@@ -264,7 +269,7 @@ class _TranslationScreenState extends State<TranslationScreen> {
                 SidebarItem(
                   index: 1,
                   icon: Icons.swap_horiz,
-                  title: 'Dịch hai chiều',
+                  title: translationModeTitle,
                   isActive: _selectedIndex == 1,
                   onTap: () => setState(() => _selectedIndex = 1),
                 ),
@@ -368,7 +373,7 @@ class _TranslationScreenState extends State<TranslationScreen> {
             child: IndexedStack(
               index: stackIndex,
               children: [
-                _buildDashboard(),
+                _buildDashboard(translationModeTitle),
                 TwoWayTranslationScreen(
                   key: _twoWayKey,
                   onHistoryAdded: _addToHistory,
@@ -376,6 +381,7 @@ class _TranslationScreenState extends State<TranslationScreen> {
                   onNewChat: _handleNewChat,
                   onViewHistory: _goToHistory,
                   onLoadFromHistory: _loadFromHistory,
+                  onModeChanged: (val) => setState(() => _isTwoWayMode = val),
                   historyItems: _historyItems,
                 ),
                 _buildHistoryScreen(),
@@ -429,7 +435,7 @@ class _TranslationScreenState extends State<TranslationScreen> {
     );
   }
 
-  Widget _buildDashboard() {
+  Widget _buildDashboard(String translationModeTitle) {
     return Center(
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
@@ -441,7 +447,7 @@ class _TranslationScreenState extends State<TranslationScreen> {
             children: [
               FeatureCard(
                 icon: Icons.swap_horiz,
-                title: 'Dịch hai chiều',
+                title: translationModeTitle,
                 desc: 'Hoàn hảo cho các cuộc họp hoặc trò chuyện nhóm',
                 onTap: () => setState(() => _selectedIndex = 1),
               ),

@@ -9,6 +9,21 @@ import 'package:http/http.dart' as http;
 import 'package:record/record.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 
+/// Kết quả Kép từ AI: Vừa khôi phục câu gốc, vừa trả về văn bản đích (Dịch hoặc Giữ nguyên nếu trùng ngôn ngữ đích)
+class DualStageTranslationResult {
+  final String reconstructedOriginal;
+  final String translatedText;
+  final String detectedSourceLangName;
+  final bool isSameAsTarget;
+
+  DualStageTranslationResult({
+    required this.reconstructedOriginal,
+    required this.translatedText,
+    this.detectedSourceLangName = 'Tự động',
+    this.isSameAsTarget = false,
+  });
+}
+
 /// Hồ sơ đặc trưng giọng nói của từng Speaker (Voiceprint Centroid)
 class SpeakerVoiceProfile {
   final int speakerId;
@@ -50,7 +65,7 @@ class SpeakerVoiceProfile {
 }
 
 class GoTransCoreEngine {
-  // --- 1. Quản lý Luồng Thu âm & Lọc Nhiễu Động (Adaptive Noise Cancellation) ---
+  // --- 1. Hai luồng chạy song song: Web Speech API + Web Audio API ---
   final stt.SpeechToText _speech = stt.SpeechToText();
   final AudioRecorder _vadRecorder = AudioRecorder();
   final FlutterTts _tts = FlutterTts();
@@ -59,30 +74,36 @@ class GoTransCoreEngine {
   bool _isListening = false;
   bool _isPaused = false;
   bool _isTtsInitialized = false;
-  String _currentSourceLocale = 'en-US';
-  String _currentTargetLang = 'Tiếng Việt';
+  String _currentSourceLocale = 'vi-VN';
+  String _currentTargetLang = 'Việt';
+
+  // Chế độ ngôn ngữ: Auto-detect vs Cố định 2 chiều
+  bool _isAutoDetectSource = true;
+  bool _isTwoWayMode = false;
+  String _originalSourceLangName = 'Tự động';
 
   // Audio settings
   InputDevice? _selectedInputDevice;
   double _ttsVolume = 1.0;
   double _ttsSpeechRate = 0.95;
 
-  // --- CƠ CHẾ LỌC NHIỄU NỀN ĐỘNG (ADAPTIVE NOISE FLOOR) & DELTA SLICING ---
-  double _adaptiveNoiseFloor = 10.0;     // Tự động học mức tiếng ồn nền của phòng
-  String _rawSessionTranscript = '';     // Chuỗi cộng dồn của phiên hiện tại
-  String _committedPrefixInSession = ''; // Phần chuỗi đã chốt trong phiên
-  String _activeInterimTranscript = '';  // Phần chữ mới phát sinh (Delta)
+  // --- CƠ CHẾ ZERO-DROP DELTA SLICING & N-BEST ALTERNATES ---
+  double _adaptiveNoiseFloor = 8.0;
+  String _rawSessionTranscript = '';
+  String _committedPrefixInSession = '';
+  String _activeInterimTranscript = '';
+  List<String> _activeInterimAlternates = [];
   String _lastFinalizedText = '';
   int _lastDraftWordCount = 0;
   bool _isTranslatingDraft = false;
   bool _isSpeakingVad = false;
   DateTime _lastSpeechTimestamp = DateTime.now();
-  DateTime _lastTextChangeTimestamp = DateTime.now(); // Theo dõi lúc chữ thực sự thay đổi (Chống kẹt VAD khi phòng ồn)
+  DateTime _lastTextChangeTimestamp = DateTime.now();
   DateTime _utteranceStartTime = DateTime.now();
   DateTime _lastFinalizationTimestamp = DateTime.now();
   Timer? _vadMonitorTimer;
 
-  // Cấu hình VAD & Diarization
+  // Cấu hình VAD nhạy bén
   double vadThreshold;
   int silenceDurationMs;
   int speakerSwitchSilenceMs;
@@ -110,19 +131,19 @@ class GoTransCoreEngine {
   final Function(int newSpeakerId)? onSpeakerChanged;
   final Function(List<SpeakerVoiceProfile> profiles)? onSpeakerProfilesUpdated;
   final Function(String liveOriginal, String liveDraftTranslation, int latencyMs)? onPartialResult;
-  final Function(String finalOriginal, String finalTranslation, int speakerId, int latencyMs)? onFinalSentence;
+  final Function(String finalOriginal, String finalTranslation, int speakerId, String sourceLang, String targetLang, int latencyMs)? onFinalSentence;
   final Function(String errorMessage)? onError;
 
   GoTransCoreEngine({
-    this.vadThreshold = 14.0,
-    this.silenceDurationMs = 700, // Chốt câu nhạy sau 700ms khi không có chữ mới
+    this.vadThreshold = 11.0,
+    this.silenceDurationMs = 850,
     this.speakerSwitchSilenceMs = 2600,
     this.autoDiarization = true,
     this.autoSpeakTranslation = false,
     this.maxSpeakers = 8,
     this.speakerSimilarityThreshold = 0.58,
-    this.maxWindowSize = 5,
-    this.meetingContext = 'Cuộc họp kỹ thuật triển khai hệ thống AI thu âm thời gian thực và tối ưu hóa độ trễ truyền tải.',
+    this.maxWindowSize = 6,
+    this.meetingContext = 'Hội thoại giao tiếp song ngữ Việt - Anh và thảo luận trực tiếp.',
     this.customApiKey = '',
     Map<String, String>? initialGlossary,
     this.onVadStatsChanged,
@@ -150,7 +171,9 @@ class GoTransCoreEngine {
     return await _vadRecorder.listInputDevices();
   }
 
-  void setInputDevice(InputDevice device) => _selectedInputDevice = device;
+  void setInputDevice(InputDevice device) {
+    _selectedInputDevice = device;
+  }
 
   void setTtsVolume(double volume) {
     _ttsVolume = volume.clamp(0.0, 1.0);
@@ -180,18 +203,30 @@ class GoTransCoreEngine {
   }
 
   // ===========================================================================
-  // PHẦN 1: THU ÂM CHỐNG ỒN & TỰ ĐỘNG HIỆU CHỈNH NỀN TẠP ÂM (NOISE FLOOR)
+  // PHẦN 1: LUỒNG NGHE SONG NGỮ TỰ ĐỘNG (BILINGUAL ZERO-DROP STREAM)
   // ===========================================================================
   Future<bool> startRecording({
-    String sourceLocaleId = 'en-US',
+    String sourceLocaleId = 'auto',
     String targetLanguage = 'Tiếng Việt',
+    String? sourceLangName,
   }) async {
-    _currentSourceLocale = _normalizeSpeechLocale(sourceLocaleId, targetLanguage);
+    final sLower = sourceLocaleId.toLowerCase().trim();
+    final nameLower = (sourceLangName ?? '').toLowerCase().trim();
+
+    _isAutoDetectSource = (sLower == 'auto' ||
+        sLower.contains('tự động') ||
+        sLower.contains('auto-detect') ||
+        nameLower.contains('tự động') ||
+        nameLower.contains('auto'));
+
+    _isTwoWayMode = !_isAutoDetectSource;
+    _originalSourceLangName = sourceLangName ?? (_isAutoDetectSource ? 'Tự động' : 'Anh');
     _currentTargetLang = targetLanguage;
+    _currentSourceLocale = _normalizeSpeechLocale(sourceLocaleId, targetLanguage);
 
     bool speechAvailable = await _speech.initialize(
       debugLogging: false,
-      finalTimeout: const Duration(seconds: 5),
+      finalTimeout: const Duration(seconds: 6),
       onStatus: (status) {
         if ((status == 'done' || status == 'notListening') && _isListening && !_isPaused) {
           if (_activeInterimTranscript.trim().isNotEmpty) {
@@ -205,14 +240,13 @@ class GoTransCoreEngine {
         }
       },
       onError: (err) {
-        // Khi môi trường ồn gây lỗi 'no-speech' hoặc 'network', tự động nối lại ngay lập tức mà không tắt mic
         if (_isListening && !_isPaused) {
           if (_activeInterimTranscript.trim().isNotEmpty) {
             _commitActiveDeltaSegment();
           }
           _committedPrefixInSession = '';
           _rawSessionTranscript = '';
-          Future.delayed(const Duration(milliseconds: 30), () {
+          Future.delayed(const Duration(milliseconds: 25), () {
             if (_isListening && !_isPaused) _startWebSpeechLoop();
           });
         }
@@ -226,10 +260,11 @@ class GoTransCoreEngine {
 
     _isListening = true;
     _isPaused = false;
-    _adaptiveNoiseFloor = 10.0;
+    _adaptiveNoiseFloor = 8.0;
     _rawSessionTranscript = '';
     _committedPrefixInSession = '';
     _activeInterimTranscript = '';
+    _activeInterimAlternates = [];
     _lastFinalizedText = '';
     _lastDraftWordCount = 0;
     _lastSpeechTimestamp = DateTime.now();
@@ -246,7 +281,7 @@ class GoTransCoreEngine {
 
   Future<void> setPaused(bool paused) async {
     if (paused) {
-      await Future.delayed(const Duration(milliseconds: 150));
+      await Future.delayed(const Duration(milliseconds: 160));
       if (_activeInterimTranscript.trim().isNotEmpty) {
         _commitActiveDeltaSegment();
       }
@@ -257,22 +292,19 @@ class GoTransCoreEngine {
       _lastTextChangeTimestamp = DateTime.now();
       _utteranceStartTime = DateTime.now();
       if (_isListening && !_speech.isListening) {
-        _committedPrefixInSession = '';
-        _rawSessionTranscript = '';
         _startWebSpeechLoop();
       }
     }
   }
 
+  /// QUAN TRỌNG: Giải quyết lỗi nói Tiếng Việt bị thu thành chữ Tiếng Anh ("Tell me", "Dollar General")
+  /// Khi chọn "Tự động", ưu tiên khởi tạo bộ thu đa ngữ `vi-VN` của Google vì:
+  /// - `vi-VN` nhận diện chuẩn 100% câu Tiếng Việt có dấu VÀ vẫn nhận diện tốt các câu Tiếng Anh phổ thông ("Hello everyone", "I want to...").
+  /// - Ngược lại, nếu đặt `en-US`, bộ thu hoàn toàn mù Tiếng Việt và sẽ biến mọi câu Tiếng Việt thành từ Tiếng Anh sai lệch!
   String _normalizeSpeechLocale(String rawSource, String targetLang) {
     final s = rawSource.toLowerCase().trim();
     if (s == 'auto' || s.contains('tự động') || s.contains('auto-detect')) {
-      final t = targetLang.toLowerCase().trim();
-      if (t.contains('vi') || t.contains('việt')) {
-        return 'en-US';
-      } else {
-        return 'vi-VN';
-      }
+      return 'vi-VN';
     }
     if (s.contains('vi') || s.contains('việt')) return 'vi-VN';
     if (s.contains('en') || s.contains('anh')) return 'en-US';
@@ -287,7 +319,7 @@ class GoTransCoreEngine {
     if (s.contains('ru') || s.contains('nga')) return 'ru-RU';
     if (s.contains('th') || s.contains('thái')) return 'th-TH';
     if (s.contains('id') || s.contains('indonesia')) return 'id-ID';
-    return 'en-US';
+    return rawSource;
   }
 
   void _startWebSpeechLoop() {
@@ -299,39 +331,53 @@ class GoTransCoreEngine {
       listenFor: const Duration(minutes: 15),
       listenOptions: stt.SpeechListenOptions(
         partialResults: true,
-        cancelOnError: false, // Bắt buộc false để không bị văng khi có tiếng ồn lớn đột ngột
-        onDevice: false,      // Sử dụng mô hình Cloud Conformer lớn nhất để lọc tiếng ồn tốt nhất
+        cancelOnError: false,
+        onDevice: false,
         listenMode: stt.ListenMode.dictation,
         autoPunctuation: true,
       ),
       onSoundLevelChange: (level) {
         if (_vadAudioSub == null && !_isPaused) {
-          final fallbackRms = ((level + 2) * 8.5).clamp(0.0, 100.0);
-          _processAdaptiveNoiseAndVad(fallbackRms);
+          final boostedRms = ((level + 2.5) * 9.5).clamp(0.0, 100.0);
+          _processAdaptiveNoiseAndVad(boostedRms);
         }
       },
       onResult: (result) {
-        if (_isPaused) return;
+        if (!_isListening || _isPaused) return;
 
-        // Chọn phương án nhận diện tốt nhất từ danh sách alternates (Nếu môi trường ồn)
-        String fullRecognized = result.recognizedWords.trim();
-        if (result.alternates.length > 1) {
-          for (final alt in result.alternates) {
-            if (alt.confidence > 0.75 && alt.recognizedWords.trim().length > fullRecognized.length) {
-              fullRecognized = alt.recognizedWords.trim();
-              break;
-            }
+        final List<String> candidates = [];
+        if (result.recognizedWords.trim().isNotEmpty) {
+          candidates.add(result.recognizedWords.trim());
+        }
+        for (final alt in result.alternates) {
+          final altText = alt.recognizedWords.trim();
+          if (altText.isNotEmpty && !candidates.contains(altText)) {
+            candidates.add(altText);
+          }
+        }
+        if (candidates.isEmpty) return;
+
+        String bestFullRecognized = candidates.first;
+        for (final alt in result.alternates) {
+          final altText = alt.recognizedWords.trim();
+          if (alt.confidence >= 0.65 && altText.split(' ').length > bestFullRecognized.split(' ').length) {
+            bestFullRecognized = altText;
           }
         }
 
-        if (fullRecognized.isEmpty) return;
-        _rawSessionTranscript = fullRecognized;
+        _rawSessionTranscript = bestFullRecognized;
 
-        final String deltaText = _extractUncommittedDelta(fullRecognized);
+        final String deltaText = _extractUncommittedDelta(bestFullRecognized);
         if (deltaText.isEmpty) return;
 
-        // Chỉ cập nhật _lastTextChangeTimestamp khi thực sự có chữ mới xuất hiện!
-        // Điều này giúp hệ thống chốt câu chính xác ngay cả khi phòng rất ồn (RMS luôn cao)
+        final List<String> deltaAlternates = [];
+        for (final cand in candidates) {
+          final dAlt = _extractUncommittedDelta(cand);
+          if (dAlt.isNotEmpty && dAlt.toLowerCase() != deltaText.toLowerCase() && !deltaAlternates.contains(dAlt)) {
+            deltaAlternates.add(dAlt);
+          }
+        }
+
         if (deltaText != _activeInterimTranscript) {
           _lastTextChangeTimestamp = DateTime.now();
           _lastSpeechTimestamp = DateTime.now();
@@ -342,9 +388,10 @@ class GoTransCoreEngine {
           _utteranceStartTime = DateTime.now();
         }
 
-        if (!result.finalResult) {
-          _activeInterimTranscript = deltaText;
+        _activeInterimTranscript = deltaText;
+        _activeInterimAlternates = deltaAlternates.take(3).toList();
 
+        if (!result.finalResult) {
           if (autoDiarization && _currentUtterancePitches.length >= 4) {
             final previewSpk = _identifyOrCreateSpeaker(deltaText, isCommit: false);
             if (previewSpk != currentSpeaker) {
@@ -353,36 +400,33 @@ class GoTransCoreEngine {
             }
           }
 
-          onPartialResult?.call(deltaText, '', 0);
-          _triggerThrottledDraftTranslation(deltaText);
+          // Nếu câu đang nói có dấu Tiếng Việt rõ ràng và trùng ngôn ngữ đích -> Giữ nguyên ngay lập tức
+          if (_isAutoDetectSource && _isPureTargetLanguage(deltaText, _currentTargetLang)) {
+            onPartialResult?.call(deltaText, deltaText, 0);
+          } else {
+            onPartialResult?.call(deltaText, '', 0);
+            _triggerThrottledDraftTranslation(deltaText, _activeInterimAlternates);
+          }
         } else {
-          _activeInterimTranscript = deltaText;
           _commitActiveDeltaSegment();
-          _committedPrefixInSession = '';
-          _rawSessionTranscript = '';
         }
       },
     );
   }
 
-  /// Thuật toán lọc nhiễu nền động (Adaptive Noise Floor):
-  /// Tự động nâng ngưỡng VAD nếu phòng ồn để không bị kẹt trạng thái SPEAKING
   void _processAdaptiveNoiseAndVad(double rms) {
     final now = DateTime.now();
     final int timeSinceLastTextChange = now.difference(_lastTextChangeTimestamp).inMilliseconds;
 
-    // Nếu quá 500ms không có chữ mới nào được nhận diện, coi âm thanh hiện tại là tiếng ồn nền (Noise Floor)
     if (timeSinceLastTextChange > 500) {
-      _adaptiveNoiseFloor = (0.92 * _adaptiveNoiseFloor + 0.08 * rms).clamp(5.0, 55.0);
+      _adaptiveNoiseFloor = (0.92 * _adaptiveNoiseFloor + 0.08 * rms).clamp(4.0, 45.0);
     }
 
-    // Ngưỡng VAD thực tế = Max(Ngưỡng cài đặt, Tiếng ồn nền + 8.0 dB)
-    final double dynamicThreshold = max(vadThreshold, _adaptiveNoiseFloor + 8.0);
+    final double dynamicThreshold = max(vadThreshold, _adaptiveNoiseFloor + 5.5);
 
     if (rms >= dynamicThreshold) {
       _currentUtteranceRms.add(rms);
       _lastSpeechTimestamp = now;
-      // Tránh việc tiếng ồn nền giữ trạng thái SPEAKING mãi mãi nếu không có chữ nào mới
       if (timeSinceLastTextChange < 1200) {
         _isSpeakingVad = true;
       }
@@ -410,28 +454,45 @@ class GoTransCoreEngine {
     final List<String> fullWords = cleanFull.split(RegExp(r'\s+'));
     final List<String> prefixWords = cleanPrefix.split(RegExp(r'\s+'));
 
-    if (fullWords.length > prefixWords.length) {
+    String normalize(String s) => s.replaceAll(RegExp(r'[^\w\s]'), '').toLowerCase();
+
+    if (fullWords.length >= prefixWords.length) {
+      final Set<String> prefixSet = prefixWords.map(normalize).toSet();
       int matchCount = 0;
-      for (int i = 0; i < prefixWords.length; i++) {
-        if (fullWords[i].toLowerCase() == prefixWords[i].toLowerCase()) {
+      int checkLimit = prefixWords.length;
+
+      for (int i = 0; i < checkLimit; i++) {
+        if (prefixSet.contains(normalize(fullWords[i]))) {
           matchCount++;
         }
       }
-      if (matchCount >= (prefixWords.length * 0.55).floor()) {
+
+      if (matchCount >= (checkLimit * 0.5).ceil()) {
         return fullWords.sublist(prefixWords.length).join(' ').trim();
+      }
+    } else {
+      final Set<String> fullSet = fullWords.map(normalize).toSet();
+      int matchCount = 0;
+      int checkLimit = fullWords.length;
+
+      for (int i = 0; i < checkLimit; i++) {
+        if (fullSet.contains(normalize(prefixWords[i]))) {
+          matchCount++;
+        }
+      }
+
+      if (matchCount >= (checkLimit * 0.5).ceil()) {
+        return '';
       }
     }
 
-    if (fullWords.length < prefixWords.length) {
-      _committedPrefixInSession = '';
-      return cleanFull;
-    }
-
+    _committedPrefixInSession = '';
     return cleanFull;
   }
 
   void _commitActiveDeltaSegment() {
     final String segmentToCommit = _activeInterimTranscript.trim();
+    final List<String> alternatesToCommit = List<String>.from(_activeInterimAlternates);
     if (segmentToCommit.isEmpty) return;
 
     if (_rawSessionTranscript.isNotEmpty) {
@@ -442,13 +503,36 @@ class GoTransCoreEngine {
     }
 
     _activeInterimTranscript = '';
+    _activeInterimAlternates = [];
     _lastDraftWordCount = 0;
     _isSpeakingVad = false;
 
-    if (segmentToCommit.toLowerCase() == _lastFinalizedText.toLowerCase() &&
-        DateTime.now().difference(_lastFinalizationTimestamp).inMilliseconds < 1500) {
-      return;
+    final int timeDiffMs = DateTime.now().difference(_lastFinalizationTimestamp).inMilliseconds;
+
+    String normalize(String s) => s.replaceAll(RegExp(r'[^\w\s]'), '').toLowerCase();
+    final String normSegment = normalize(segmentToCommit);
+    final String normLast = normalize(_lastFinalizedText);
+
+    bool isDuplicate = false;
+
+    if (normSegment == normLast) {
+      isDuplicate = true;
+    } else if (timeDiffMs < 2500 && normLast.isNotEmpty) {
+      final List<String> segWords = normSegment.split(RegExp(r'\s+'));
+      final List<String> lastWords = normLast.split(RegExp(r'\s+'));
+
+      final Set<String> lastSet = lastWords.toSet();
+      int matchCount = 0;
+      for (var w in segWords) {
+        if (w.isNotEmpty && lastSet.contains(w)) matchCount++;
+      }
+
+      if (matchCount >= (segWords.length * 0.75).floor() && matchCount >= (lastWords.length * 0.75).floor()) {
+        isDuplicate = true;
+      }
     }
+
+    if (isDuplicate) return;
 
     _lastFinalizedText = segmentToCommit;
 
@@ -458,7 +542,11 @@ class GoTransCoreEngine {
     }
     _lastFinalizationTimestamp = DateTime.now();
 
-    _finalizeSentenceAndTranslate(segmentToCommit, currentSpeaker);
+    _finalizeSentenceAndTranslate(
+      segmentToCommit,
+      currentSpeaker,
+      asrAlternates: alternatesToCommit,
+    );
   }
 
   Future<void> _startParallelAudioVadMonitor() async {
@@ -470,9 +558,9 @@ class GoTransCoreEngine {
             sampleRate: 16000,
             numChannels: 1,
             device: _selectedInputDevice,
-            echoCancel: false,   // Tắt Echo Cancel khi thu từ loa ngoài điện thoại để không bị cắt mất tiếng video!
-            noiseSuppress: true, // Giữ lọc tạp âm môi trường
-            autoGain: true,      // Tự động khuếch đại âm lượng nhỏ từ loa điện thoại
+            echoCancel: false,
+            noiseSuppress: true,
+            autoGain: true,
           );
           final stream = await _vadRecorder.startStream(config);
           _vadAudioSub = stream.listen((Uint8List pcmBytes) {
@@ -488,23 +576,24 @@ class GoTransCoreEngine {
     _vadMonitorTimer = Timer.periodic(const Duration(milliseconds: 80), (_) {
       if (!_isListening || _isPaused) return;
       final now = DateTime.now();
-
-      // QUAN TRỌNG TRONG MÔI TRƯỜNG ỒN:
-      // Dựa vào thời gian chữ ngừng thay đổi (_lastTextChangeTimestamp) kết hợp với âm lượng
-      // Ngay cả khi phòng rất ồn làm mic luôn báo có âm thanh, hễ bạn bấm Pause video 750ms
-      // (không có chữ mới sinh ra) là hệ thống tự động cắt câu và dịch ngay!
       final int noNewWordsElapsed = now.difference(_lastTextChangeTimestamp).inMilliseconds;
 
-      if (_activeInterimTranscript.trim().isNotEmpty && noNewWordsElapsed >= silenceDurationMs) {
-        onVadStatsChanged?.call(_adaptiveNoiseFloor, noNewWordsElapsed, 'FINALIZING');
-        _commitActiveDeltaSegment();
+      if (_activeInterimTranscript.trim().isNotEmpty) {
+        final int currentWords = _activeInterimTranscript.trim().split(RegExp(r'\s+')).length;
+        final int effectiveSilenceMs = (currentWords <= 3)
+            ? (silenceDurationMs + 200)
+            : silenceDurationMs;
+
+        final bool isLongRapidStream = currentWords >= 26 && noNewWordsElapsed >= 420;
+
+        if (noNewWordsElapsed >= effectiveSilenceMs || isLongRapidStream) {
+          onVadStatsChanged?.call(_adaptiveNoiseFloor, noNewWordsElapsed, 'FINALIZING');
+          _commitActiveDeltaSegment();
+        }
       }
     });
   }
 
-  // ===========================================================================
-  // PHẦN 2: THUẬT TOÁN TRÍCH XUẤT ĐẶC TRƯNG GIỌNG NÓI & PHÂN CỤM ĐA SPEAKER
-  // ===========================================================================
   void _extractAcousticFeaturesFromPcm(Uint8List chunk) {
     if (chunk.length < 64) return;
     final byteData = ByteData.sublistView(chunk);
@@ -524,9 +613,9 @@ class GoTransCoreEngine {
     }
 
     final double rawRms = sqrt(sumSquares / sampleCount);
-    final double normalizedRms = (rawRms * 260.0).clamp(0.0, 100.0);
+    final double normalizedRms = (rawRms * 310.0).clamp(0.0, 100.0);
 
-    final double dynamicThreshold = max(vadThreshold, _adaptiveNoiseFloor + 8.0);
+    final double dynamicThreshold = max(vadThreshold, _adaptiveNoiseFloor + 5.5);
     if (normalizedRms >= dynamicThreshold) {
       final double zcr = zeroCrossings / (sampleCount - 1);
       final double pitchHz = _estimatePitchAutocorrelation(samples, 16000);
@@ -730,12 +819,96 @@ class GoTransCoreEngine {
     return bestMatch?.speakerId ?? ((currentSpeaker % maxSpeakers) + 1);
   }
 
+  /// Phân tích chính xác ngôn ngữ thực tế của câu thu được (Kể cả câu pha trộn hoặc không dấu)
   String _detectTextLanguageHeuristic(String text) {
-    final vietnameseRegex = RegExp(
+    final trimmed = text.trim();
+    if (trimmed.isEmpty) return 'en';
+
+    if (RegExp(r'[\u3040-\u309F\u30A0-\u30FF]').hasMatch(trimmed)) return 'ja';
+    if (RegExp(r'[\uAC00-\uD7AF\u1100-\u11FF]').hasMatch(trimmed)) return 'ko';
+    if (RegExp(r'[\u4E00-\u9FFF]').hasMatch(trimmed)) return 'zh-CN';
+
+    final vietnameseDiacritics = RegExp(
       r'[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]',
       caseSensitive: false,
     );
-    return vietnameseRegex.hasMatch(text) ? 'vi' : 'en';
+
+    final words = trimmed.split(RegExp(r'\s+'));
+    int viWordCount = 0;
+    int enWordCount = 0;
+
+    const commonEnglishWords = {
+      'hello', 'everyone', 'hi', 'welcome', 'today', 'we', 'will', 'need', 'to',
+      'the', 'and', 'for', 'with', 'this', 'that', 'what', 'about', 'how', 'are',
+      'you', 'thank', 'thanks', 'good', 'morning', 'afternoon', 'evening', 'meeting',
+      'project', 'system', 'data', 'time', 'want', 'tell', 'me', 'can', 'please',
+      'let', 'know', 'think', 'agree', 'right', 'now', 'because', 'so', 'very',
+      'much', 'from', 'have', 'has', 'had', 'not', 'don\'t', 'it', 'is', 'was'
+    };
+
+    for (final rawW in words) {
+      final w = rawW.replaceAll(RegExp(r'[^\p{L}]', unicode: true), '').toLowerCase();
+      if (w.isEmpty) continue;
+      if (vietnameseDiacritics.hasMatch(w)) {
+        viWordCount++;
+      } else if (commonEnglishWords.contains(w)) {
+        enWordCount++;
+      }
+    }
+
+    if (enWordCount > viWordCount) return 'en';
+    if (viWordCount > 0) return 'vi';
+
+    return 'en';
+  }
+
+  /// Kiểm tra xem câu vừa thu có phải là thuần ngôn ngữ đích (không lẫn từ tiếng Anh cần dịch) hay không
+  bool _isPureTargetLanguage(String text, String targetLanguage) {
+    final String targetIso = _resolveIsoLangCode(targetLanguage);
+    final String detectedIso = _detectTextLanguageHeuristic(text);
+
+    if (detectedIso != targetIso) return false;
+
+    if (targetIso == 'vi') {
+      final vietnameseDiacritics = RegExp(
+        r'[àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ]',
+        caseSensitive: false,
+      );
+      // Có dấu Tiếng Việt và không phải câu Tiếng Anh bị phiên âm
+      final words = text.trim().split(RegExp(r'\s+'));
+      int diacriticWords = 0;
+      for (final w in words) {
+        if (vietnameseDiacritics.hasMatch(w)) diacriticWords++;
+      }
+      return diacriticWords >= (words.length * 0.4).ceil();
+    }
+
+    return true;
+  }
+
+  String _isoToDisplayLangName(String isoCode) {
+    switch (isoCode) {
+      case 'vi':
+        return 'Việt';
+      case 'en':
+        return 'Anh';
+      case 'ja':
+        return 'Nhật';
+      case 'ko':
+        return 'Hàn';
+      case 'zh-CN':
+        return 'Trung (Giản)';
+      case 'zh-TW':
+        return 'Trung (Phồn)';
+      case 'fr':
+        return 'Pháp';
+      case 'de':
+        return 'Đức';
+      case 'es':
+        return 'Tây Ban Nha';
+      default:
+        return 'Anh';
+    }
   }
 
   void _clearCurrentUtteranceAcousticBuffer() {
@@ -750,13 +923,22 @@ class GoTransCoreEngine {
     _vadMonitorTimer?.cancel();
     await _vadAudioSub?.cancel();
     _vadAudioSub = null;
+
+    if (_activeInterimTranscript.trim().isNotEmpty) {
+      _commitActiveDeltaSegment();
+    }
+
     try {
       await _vadRecorder.stop();
     } catch (_) {}
+
     await _speech.stop();
+    await Future.delayed(const Duration(milliseconds: 100));
+
     _rawSessionTranscript = '';
     _committedPrefixInSession = '';
     _activeInterimTranscript = '';
+    _activeInterimAlternates = [];
     _clearCurrentUtteranceAcousticBuffer();
     onVadStatsChanged?.call(0.0, 0, 'IDLE');
   }
@@ -769,9 +951,9 @@ class GoTransCoreEngine {
   }
 
   // ===========================================================================
-  // PHẦN 3: SỬA LỖI NGHE NHẦM DO TIẾNG ỒN (ASR ERROR RECOVERY) & DỊCH ĐA TẦNG
+  // PHẦN 3: AI PHONETIC ASR RECONSTRUCTION, AUTO-DETECT PASSTHROUGH & TRANSLATION
   // ===========================================================================
-  Future<void> _triggerThrottledDraftTranslation(String interimText) async {
+  Future<void> _triggerThrottledDraftTranslation(String interimText, List<String> alternates) async {
     final words = interimText.trim().split(RegExp(r'\s+'));
     if (words.length - _lastDraftWordCount < 2 || _isTranslatingDraft) return;
 
@@ -779,56 +961,144 @@ class GoTransCoreEngine {
     _isTranslatingDraft = true;
     final sw = Stopwatch()..start();
 
-    final draftTranslated = await translateTextWithContext(
+    String target = _currentTargetLang;
+    if (_isTwoWayMode) {
+      final detected = _detectTextLanguageHeuristic(interimText);
+      final String targetIso = _resolveIsoLangCode(_currentTargetLang);
+      if (detected == targetIso) {
+        target = _originalSourceLangName;
+      }
+    }
+
+    final dualResult = await reconstructAndTranslateWithContext(
       interimText,
-      targetLanguage: _currentTargetLang,
+      targetLanguage: target,
       isFinalSentence: false,
       speakerId: currentSpeaker,
+      asrAlternates: alternates,
     );
     sw.stop();
 
     if (_activeInterimTranscript.isNotEmpty) {
-      onPartialResult?.call(_activeInterimTranscript, draftTranslated, sw.elapsedMilliseconds);
+      onPartialResult?.call(
+        dualResult.reconstructedOriginal,
+        dualResult.translatedText,
+        sw.elapsedMilliseconds,
+      );
     }
     _isTranslatingDraft = false;
   }
 
-  Future<void> _finalizeSentenceAndTranslate(String finalSentence, int speakerId) async {
+  Future<void> _finalizeSentenceAndTranslate(
+      String finalSentence,
+      int speakerId, {
+        List<String> asrAlternates = const [],
+      }) async {
     if (finalSentence.trim().isEmpty) return;
     final sw = Stopwatch()..start();
 
-    final finalTranslation = await translateTextWithContext(
+    final String detectedIso = _detectTextLanguageHeuristic(finalSentence);
+    final String targetIso = _resolveIsoLangCode(_currentTargetLang);
+
+    String target = _currentTargetLang;
+    String source = _isoToDisplayLangName(detectedIso);
+
+    if (_isTwoWayMode) {
+      if (detectedIso == targetIso) {
+        target = _originalSourceLangName;
+        source = _currentTargetLang;
+      } else {
+        source = _originalSourceLangName;
+      }
+    } else {
+      target = _currentTargetLang;
+    }
+
+    final dualResult = await reconstructAndTranslateWithContext(
       finalSentence,
-      targetLanguage: _currentTargetLang,
+      targetLanguage: target,
       isFinalSentence: true,
       speakerId: speakerId,
+      asrAlternates: asrAlternates,
     );
     sw.stop();
 
-    onFinalSentence?.call(finalSentence, finalTranslation, speakerId, sw.elapsedMilliseconds);
+    if (dualResult.detectedSourceLangName.isNotEmpty) {
+      source = dualResult.detectedSourceLangName;
+    }
+
+    onFinalSentence?.call(
+      dualResult.reconstructedOriginal,
+      dualResult.translatedText,
+      speakerId,
+      source,
+      target,
+      sw.elapsedMilliseconds,
+    );
 
     if (autoSpeakTranslation) {
-      await speakNative(finalTranslation, targetLanguage: _currentTargetLang);
+      await speakNative(dualResult.translatedText, targetLanguage: target);
     }
   }
 
-  /// Dịch thuật tích hợp AI Phonetic Error Correction:
-  /// Tự động khôi phục các từ bị nhận diện sai do tạp âm/tiếng ồn trước khi dịch
   Future<String> translateTextWithContext(
       String text, {
         String targetLanguage = 'Tiếng Việt',
         bool isFinalSentence = true,
         int? speakerId,
       }) async {
-    final cleanInput = text.trim();
-    if (cleanInput.isEmpty) return '';
+    final res = await reconstructAndTranslateWithContext(
+      text,
+      targetLanguage: targetLanguage,
+      isFinalSentence: isFinalSentence,
+      speakerId: speakerId,
+    );
+    return res.translatedText;
+  }
+
+  /// Bộ máy AI 2 tầng xử lý triệt để cả 2 chiều:
+  /// - Khi bạn nói Tiếng Việt: Thu chuẩn Tiếng Việt -> Trùng ngôn ngữ đích (`Việt`) -> Giữ nguyên văn bản 100%!
+  /// - Khi bạn nói Tiếng Anh: Khôi phục chuẩn câu Tiếng Anh (nếu bị phiên âm nhẹ sang âm Việt) -> Dịch sang Tiếng Việt!
+  Future<DualStageTranslationResult> reconstructAndTranslateWithContext(
+      String rawAsrText, {
+        String targetLanguage = 'Tiếng Việt',
+        bool isFinalSentence = true,
+        int? speakerId,
+        List<String> asrAlternates = const [],
+      }) async {
+    final cleanInput = rawAsrText.trim();
+    if (cleanInput.isEmpty) {
+      return DualStageTranslationResult(reconstructedOriginal: '', translatedText: '');
+    }
 
     final spkLabel = 'Speaker ${(speakerId ?? currentSpeaker).toString().padLeft(2, '0')}';
+    final String detectedIso = _detectTextLanguageHeuristic(cleanInput);
+    final String targetIso = _resolveIsoLangCode(targetLanguage);
+    final String detectedLangDisplay = _isoToDisplayLangName(detectedIso);
+
+    // 1. NẾU ĐANG Ở CHẾ ĐỘ "TỰ ĐỘNG" VÀ CÂU THU ĐƯỢC LÀ TIẾNG VIỆT RÕ RÀNG (TRÙNG ĐÍCH):
+    // Lập tức giữ nguyên văn bản 100% ở cả 2 cột mà không cần gọi dịch!
+    if (_isAutoDetectSource && _isPureTargetLanguage(cleanInput, targetLanguage)) {
+      final String formattedSameText = cleanInput[0].toUpperCase() + cleanInput.substring(1);
+      if (isFinalSentence) {
+        _pushToSlidingWindow('$spkLabel: $formattedSameText');
+      }
+      return DualStageTranslationResult(
+        reconstructedOriginal: formattedSameText,
+        translatedText: formattedSameText,
+        detectedSourceLangName: detectedLangDisplay,
+        isSameAsTarget: true,
+      );
+    }
 
     final demoMatch = _checkDemoDictionary(cleanInput);
     if (demoMatch != null) {
       if (isFinalSentence) _pushToSlidingWindow('$spkLabel: $cleanInput');
-      return demoMatch;
+      return DualStageTranslationResult(
+        reconstructedOriginal: cleanInput,
+        translatedText: (targetIso == 'en') ? cleanInput : demoMatch,
+        detectedSourceLangName: 'Anh',
+      );
     }
 
     String envKey = '';
@@ -848,17 +1118,35 @@ class GoTransCoreEngine {
           ? _slidingWindow.asMap().entries.map((e) => '[Câu -${_slidingWindow.length - e.key}] ${e.value}').join('\n')
           : 'Chưa có câu hội thoại trước đó.';
 
+      final alternatesFormatted = asrAlternates.isNotEmpty
+          ? asrAlternates.map((a) => '- "$a"').join('\n')
+          : 'Không có phương án phụ.';
+
       final prompt = '''
-Bạn là AI Context Engine của hệ thống dịch thuật hội nghị thời gian thực GoTrans.
-- Bối cảnh cuộc họp: $meetingContext
-- Từ điển chuyên ngành bắt buộc (Custom Glossary): $glossaryFormatted
-- Lịch sử hội thoại kèm nhãn người nói (Sliding Window Context):
+Bạn là Chuyên gia Khôi phục Ngữ âm Song ngữ (Bilingual Phonetic ASR Reconstruction) và Dịch thuật Thời gian thực của hệ thống GoTrans.
+
+1. THÔNG TIN NGỮ CẢNH:
+- Bối cảnh chủ đề: $meetingContext
+- Ngôn ngữ đích người dùng muốn nhận (`targetLanguage`): "$targetLanguage"
+- Chế độ thu âm: ${_isAutoDetectSource ? "TỰ ĐỘNG NHẬN DẠNG NGÔN NGỮ (Auto-detect)" : "Dịch 2 chiều"}
+- Từ điển chuyên ngành bắt buộc: $glossaryFormatted
+- Lịch sử các câu vừa nói trước đó:
 $historyFormatted
 
-LƯU Ý QUAN TRỌNG VỀ MÔI TRƯỜNG ỒN (ASR NOISE CORRECTION):
-Văn bản đầu vào được thu từ Microphone trong môi trường có tạp âm nên một số từ có thể bị bộ nhận diện giọng nói nghe nhầm sang từ đồng âm (homophones) hoặc bị đứt chữ. Hãy tự động suy luận và khôi phục lại từ đúng dựa trên ngữ cảnh các câu trước đó rồi mới dịch sang $targetLanguage.
-Chỉ trả về duy nhất nội dung bản dịch hoàn chỉnh, không giải thích, không kèm nhãn Speaker hay tên ngôn ngữ:
-"$cleanInput"
+2. DỮ LIỆU ĐẦU VÀO TỪ MICROPHONE:
+- Chuỗi ASR chính thu được của [$spkLabel]: "$cleanInput"
+- Các phương án ASR dự phòng (N-Best Alternates):
+$alternatesFormatted
+
+3. QUY TẮC XỬ LÝ BẮT BUỘC:
+- TRƯỜNG HỢP 1 (NGƯỜI NÓI ĐANG NÓI TIẾNG VIỆT / CÙNG NGÔN NGỮ ĐÍCH "$targetLanguage"):
+  Nếu chuỗi đầu vào là câu tiếng Việt có nghĩa (hoặc là câu tiếng Việt bị bộ thu âm nghe nhầm sang các từ tiếng Anh đồng âm vô nghĩa về mặt ngữ cảnh như "I want to wait time", "Dollar General"), hãy khôi phục lại đúng câu tiếng Việt gốc vào `reconstructed_source`, đặt `detected_lang` là "Việt", và GIỮ NGUYÊN hoàn toàn câu tiếng Việt đó ở `translated_text` (tuyệt đối không dịch sang ngôn ngữ khác).
+- TRƯỜNG HỢP 2 (NGƯỜI NÓI ĐANG NÓI TIẾNG ANH / NGÔN NGỮ KHÁC VỚI "$targetLanguage"):
+  Nếu người nói đang phát âm tiếng Anh (kể cả khi bộ thu âm `vi-VN` phiên âm một vài từ tiếng Anh sang chữ tiếng Việt đồng âm, hoặc người nói nói nhanh bị nuốt âm), hãy khôi phục lại câu tiếng Anh chuẩn xác vào `reconstructed_source`, đặt `detected_lang` là "Anh", và DỊCH câu đó sang "$targetLanguage" một cách tự nhiên, chuẩn xác ở `translated_text`.
+
+4. ĐỊNH DẠNG ĐẦU RA:
+Chỉ trả về duy nhất 1 đối tượng JSON hợp lệ có đúng 3 trường sau:
+{"reconstructed_source": "câu gốc đã khôi phục", "translated_text": "bản dịch sang $targetLanguage (hoặc giữ nguyên nếu câu gốc đã là $targetLanguage)", "detected_lang": "Việt hoặc Anh"}
 ''';
 
       final url = Uri.parse(
@@ -877,29 +1165,129 @@ Chỉ trả về duy nhất nội dung bản dịch hoàn chỉnh, không giải
                 ]
               }
             ],
-            'generationConfig': {'temperature': 0.15}
+            'generationConfig': {
+              'temperature': 0.1,
+              'responseMimeType': 'application/json',
+            }
           }),
         );
 
         if (res.statusCode == 200) {
           final data = jsonDecode(res.body);
-          final translated = data['candidates']?[0]?['content']?['parts']?[0]?['text']?.toString().trim() ?? '';
-          if (translated.isNotEmpty) {
-            if (isFinalSentence) _pushToSlidingWindow('$spkLabel: $cleanInput');
-            return _stripLanguagePrefix(translated);
+          final rawResponseText =
+              data['candidates']?[0]?['content']?['parts']?[0]?['text']?.toString().trim() ?? '';
+
+          if (rawResponseText.isNotEmpty) {
+            final parsedDual = _parseDualStageJsonResponse(
+              rawResponseText,
+              cleanInput,
+              targetLanguage: targetLanguage,
+            );
+            if (isFinalSentence) {
+              _pushToSlidingWindow('$spkLabel: ${parsedDual.reconstructedOriginal}');
+            }
+            return parsedDual;
           }
         }
       } catch (e) {
-        debugPrint('Gemini API Error: $e');
+        debugPrint('Gemini Dual-Stage API Error: $e');
       }
     }
 
-    if (isFinalSentence) _pushToSlidingWindow('$spkLabel: $cleanInput');
-    return await _realCloudFallbackTranslate(cleanInput, targetLanguage);
+    // Fallback khi không có Gemini Key hoặc mất kết nối
+    final repairedInput = _localPhoneticQuickRepair(cleanInput);
+    if (isFinalSentence) _pushToSlidingWindow('$spkLabel: $repairedInput');
+
+    if (_isAutoDetectSource && detectedIso == targetIso) {
+      return DualStageTranslationResult(
+        reconstructedOriginal: repairedInput,
+        translatedText: repairedInput,
+        detectedSourceLangName: detectedLangDisplay,
+        isSameAsTarget: true,
+      );
+    }
+
+    final fallbackTranslated = await _realCloudFallbackTranslate(repairedInput, targetLanguage);
+    return DualStageTranslationResult(
+      reconstructedOriginal: repairedInput,
+      translatedText: fallbackTranslated,
+      detectedSourceLangName: detectedLangDisplay,
+      isSameAsTarget: false,
+    );
+  }
+
+  DualStageTranslationResult _parseDualStageJsonResponse(
+      String rawJson,
+      String fallbackOriginal, {
+        required String targetLanguage,
+      }) {
+    try {
+      String cleaned = rawJson.trim();
+      if (cleaned.startsWith('```')) {
+        cleaned = cleaned.replaceAll(RegExp(r'^```json\s*|^```\s*|\s*```$'), '').trim();
+      }
+      final Map<String, dynamic> map = jsonDecode(cleaned);
+      final String reconstructed = _stripLanguagePrefix(
+        (map['reconstructed_source'] ?? fallbackOriginal).toString(),
+      );
+      String translated = _stripLanguagePrefix(
+        (map['translated_text'] ?? '').toString(),
+      );
+      final String detectedLang = (map['detected_lang'] ?? '').toString().trim();
+
+      final String sourceActual = reconstructed.isNotEmpty ? reconstructed : fallbackOriginal;
+
+      if (_isAutoDetectSource && _isPureTargetLanguage(sourceActual, targetLanguage)) {
+        translated = sourceActual;
+      }
+
+      if (translated.isNotEmpty) {
+        return DualStageTranslationResult(
+          reconstructedOriginal: sourceActual,
+          translatedText: translated,
+          detectedSourceLangName: detectedLang.isNotEmpty
+              ? detectedLang
+              : _isoToDisplayLangName(_detectTextLanguageHeuristic(sourceActual)),
+          isSameAsTarget: sourceActual.toLowerCase() == translated.toLowerCase(),
+        );
+      }
+    } catch (e) {
+      debugPrint('JSON Parse Fallback: $e');
+    }
+
+    return DualStageTranslationResult(
+      reconstructedOriginal: fallbackOriginal,
+      translatedText: _stripLanguagePrefix(rawJson),
+    );
+  }
+
+  String _localPhoneticQuickRepair(String text) {
+    String out = text.trim();
+    final Map<RegExp, String> commonFastSpeechFixes = {
+      RegExp(r'\bgonna\b', caseSensitive: false): 'going to',
+      RegExp(r'\bwanna\b', caseSensitive: false): 'want to',
+      RegExp(r'\bgotta\b', caseSensitive: false): 'got to',
+      RegExp(r'\bkinda\b', caseSensitive: false): 'kind of',
+      RegExp(r'\bsorta\b', caseSensitive: false): 'sort of',
+      RegExp(r'\blemme\b', caseSensitive: false): 'let me',
+      RegExp(r'\bgimme\b', caseSensitive: false): 'give me',
+      RegExp(r'\bcuz\b|\bcause\b', caseSensitive: false): 'because',
+    };
+    commonFastSpeechFixes.forEach((pattern, replacement) {
+      out = out.replaceAll(pattern, replacement);
+    });
+    if (out.isNotEmpty) {
+      out = out[0].toUpperCase() + out.substring(1);
+    }
+    return out;
   }
 
   Future<String> _realCloudFallbackTranslate(String text, String targetLanguage) async {
     final String tlCode = _resolveIsoLangCode(targetLanguage);
+
+    if (_isAutoDetectSource && _detectTextLanguageHeuristic(text) == tlCode) {
+      return text;
+    }
 
     try {
       final gtxUrl = Uri.parse(
@@ -981,9 +1369,6 @@ Chỉ trả về duy nhất nội dung bản dịch hoàn chỉnh, không giải
         .trim();
   }
 
-  // ===========================================================================
-  // PHẦN 4: BỘ PHÁT ÂM GIỌNG BẢN ĐỊA (NATIVE SPEAKER TTS ENGINE)
-  // ===========================================================================
   Future<void> _initNativeTts() async {
     if (_isTtsInitialized) return;
     try {
