@@ -72,4 +72,43 @@ class GeminiService {
       return 'Lỗi AI: ${errorMsg.length > 50 ? errorMsg.substring(0, 50) + "..." : errorMsg}';
     }
   }
+
+  /// Tóm tắt cuộc hội thoại qua Google Generative AI
+  Future<String> summarizeConversation(String conversationText) async {
+    if (conversationText.trim().isEmpty) return 'Cuộc hội thoại trống.';
+    
+    if (!_isConfigured) {
+      return 'Lỗi: Chưa cấu hình API Key hợp lệ trong file .env. Vui lòng kiểm tra lại.';
+    }
+
+    final prompt = '''
+    Bạn là một trợ lý AI thông minh. Hãy tóm tắt lại cuộc hội thoại dưới đây một cách ngắn gọn, súc tích và nêu bật các ý chính.
+    
+    Cuộc hội thoại:
+    $conversationText
+    ''';
+
+    try {
+      final content = [Content.text(prompt)];
+      final response = await _model.generateContent(content);
+      
+      final result = response.text?.trim() ?? '';
+      
+      if (result.isEmpty) {
+        return 'Lỗi: AI trả về kết quả rỗng.';
+      }
+      
+      return result;
+    } catch (e) {
+      debugPrint('Gemini Summarize Error: $e');
+      
+      String errorMsg = e.toString();
+      if (errorMsg.contains('403') || errorMsg.contains('permission')) {
+        return 'Lỗi: API Key không có quyền truy cập (403).';
+      } else if (errorMsg.contains('429')) {
+        return 'Lỗi: Hết hạn mức sử dụng miễn phí.';
+      }
+      return 'Lỗi tóm tắt: ${errorMsg.length > 50 ? errorMsg.substring(0, 50) + "..." : errorMsg}';
+    }
+  }
 }

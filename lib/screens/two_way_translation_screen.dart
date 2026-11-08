@@ -5,6 +5,7 @@ import 'dart:math' as math;
 import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
 import '../services/gotrans_core_enginer.dart';
+import '../services/gemini_service.dart';
 
 class TranslationSegment {
   String speakerId;
@@ -57,6 +58,8 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
   final List<TranslationSegment> _segments = [];
   final ScrollController _leftScrollController = ScrollController();
   final ScrollController _rightScrollController = ScrollController();
+  final _geminiService = GeminiService();
+
 
   final FlutterTts _flutterTts = FlutterTts();
   late final GoTransCoreEngine _gotransEngine;
@@ -64,6 +67,9 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
   bool _isRecording = false;
   bool _isStarting = false;
   bool _isPaused = false;
+  
+  final TextEditingController _textController = TextEditingController();
+  bool _isTranslatingText = false;
   // ignore: unused_field
   DateTime? _startTime;
   double _rmsLevel = 0.0;
@@ -139,10 +145,50 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
     'Uyghur', 'Uzbek', 'Việt', 'Xhosa', 'Yiddish', 'Yoruba', 'Zulu'
   ];
 
-  final GlobalKey _sourceLangBtnKey = GlobalKey();
-  final GlobalKey _targetLangBtnKey = GlobalKey();
+  final GlobalKey _sourceLangBtnKey = GlobalKey(); // Cho 1 chiều
+  final GlobalKey _targetLangBtnKey = GlobalKey(); // Cho 1 chiều
+  
+  final GlobalKey _leftSpeakBtnKey = GlobalKey();
+  final GlobalKey _leftTransBtnKey = GlobalKey();
+  final GlobalKey _rightSpeakBtnKey = GlobalKey();
+  final GlobalKey _rightTransBtnKey = GlobalKey();
+
+  bool _isTwoWayMode = false;
 
   String get currentConversationSummary => _segments.isNotEmpty ? _segments.last.originalText : "";
+
+  void forceOneWayMode() {
+    if (!mounted) return;
+    setState(() {
+      _isTwoWayMode = false;
+      if (_sourceLang != 'Tự động') {
+        _sourceLang = 'Tự động';
+      }
+    });
+  }
+
+  void forceTwoWayMode() {
+    if (!mounted) return;
+    setState(() {
+      _isTwoWayMode = true;
+      if (_sourceLang == 'Tự động') {
+        _sourceLang = 'Việt';
+      }
+    });
+  }
+
+  void stopRecordingAndTTS() {
+    if (_isRecording) {
+      _gotransEngine.stopRecording();
+      _flutterTts.stop();
+      if (mounted) {
+        setState(() {
+          _isRecording = false;
+          _isPaused = false;
+        });
+      }
+    }
+  }
 
   void resetChat() {
     if (!mounted) return;
@@ -195,6 +241,7 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
   @override
   void initState() {
     super.initState();
+    _isTwoWayMode = _sourceLang != 'Tự động';
     _initTts();
     _initGoTransEngine();
     _btnAnimController = AnimationController(
@@ -332,9 +379,59 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
     _flutterTts.stop();
     _leftScrollController.dispose();
     _rightScrollController.dispose();
+    _textController.dispose();
     _timer?.cancel();
     _btnAnimController.dispose();
     super.dispose();
+  }
+
+  void _handleTextSend() async {
+    final text = _textController.text.trim();
+    if (text.isEmpty) return;
+
+    setState(() {
+      _isTranslatingText = true;
+    });
+
+    final targetLang = _sourceLang == 'Tự động' ? 'Việt' : _targetLang;
+    final sourceLang = _sourceLang; 
+
+    // Gửi lên Gemini
+    final translated = await _geminiService.translate(text, sourceLang, targetLang);
+
+    if (!mounted) return;
+
+    setState(() {
+      _isTranslatingText = false;
+      _textController.clear();
+      
+      String sId = "Speaker ${_currentSpeakerId.toString().padLeft(2, '0')}";
+      _segments.add(TranslationSegment(
+        speakerId: sId,
+        originalText: text,
+        translatedText: translated,
+        timestamp: "Now",
+        sourceLanguage: sourceLang,
+        targetLanguage: targetLang,
+        speakerColor: _getSpeakerColor(sId),
+      ));
+      
+      // Chuyển lượt (Tuỳ chọn: Nếu đang ở chế độ 2 chiều thì luân phiên)
+      if (sourceLang != 'Tự động') {
+         _currentSpeakerId = _currentSpeakerId == 1 ? 2 : 1;
+      }
+    });
+    
+    _scrollToBottom();
+    
+    if (widget.onHistoryAdded != null) {
+      widget.onHistoryAdded!(text);
+    }
+    
+    // Gọi TTS nếu bật
+    if (_targetTtsEnabled) {
+      await _gotransEngine.speakNative(translated, targetLanguage: targetLang);
+    }
   }
 
   void _handleMicTap() {
@@ -436,6 +533,75 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
     });
   }
 
+  void _showSummaryDialog() async {
+    if (_segments.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Chưa có nội dung hội thoại để tóm tắt!')),
+      );
+      return;
+    }
+
+    final buffer = StringBuffer();
+    for (var seg in _segments) {
+      buffer.writeln('${seg.speakerId}: ${seg.originalText}');
+    }
+    
+    showDialog(
+      context: context,
+      builder: (ctx) {
+        return Dialog(
+          backgroundColor: Theme.of(context).cardColor,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          child: Container(
+            width: MediaQuery.of(context).size.width > 600 ? 500 : MediaQuery.of(context).size.width * 0.9,
+            padding: const EdgeInsets.all(24),
+            constraints: BoxConstraints(
+              maxHeight: MediaQuery.of(context).size.height * 0.8,
+            ),
+            child: FutureBuilder<String>(
+              future: _geminiService.summarizeConversation(buffer.toString()),
+              builder: (context, snapshot) {
+                return Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const Icon(Icons.auto_awesome, color: Colors.blueAccent),
+                        const SizedBox(width: 8),
+                        const Text('AI Tóm tắt', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white)),
+                        const Spacer(),
+                        IconButton(
+                          icon: const Icon(Icons.close, color: Colors.white54),
+                          onPressed: () => Navigator.pop(context),
+                        ),
+                      ],
+                    ),
+                    const Divider(color: Colors.white24),
+                    const SizedBox(height: 16),
+                    if (snapshot.connectionState == ConnectionState.waiting)
+                      const Center(child: Padding(padding: EdgeInsets.all(20), child: CircularProgressIndicator()))
+                    else if (snapshot.hasError)
+                      Text('Lỗi: ${snapshot.error}', style: const TextStyle(color: Colors.redAccent))
+                    else
+                      Expanded(
+                        child: SingleChildScrollView(
+                          child: SelectableText(
+                            snapshot.data ?? 'Không có dữ liệu',
+                            style: const TextStyle(fontSize: 15, color: Colors.white70, height: 1.5),
+                          ),
+                        ),
+                      ),
+                  ],
+                );
+              },
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -462,7 +628,7 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
   }
 
   Widget _buildHeader() {
-    final String title = _sourceLang == 'Tự động' ? 'Dịch một chiều' : 'Dịch 2 chiều';
+    final String title = !_isTwoWayMode ? 'Dịch một chiều' : 'Dịch 2 chiều';
     return Padding(
       padding: const EdgeInsets.fromLTRB(24, 16, 24, 8),
       child: Row(
@@ -477,12 +643,19 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
           const SizedBox(width: 8),
           Text(title, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: textDark)),
           const Spacer(),
+          IconButton(
+            onPressed: _showSummaryDialog,
+            icon: const Icon(Icons.summarize, color: Colors.blueAccent),
+            tooltip: 'Tóm tắt hội thoại',
+          ),
         ],
       ),
     );
   }
 
   Widget _buildLanguageBar() {
+    if (_isTwoWayMode) return const SizedBox.shrink(); // Ẩn thanh ngôn ngữ chung ở chế độ 2 chiều
+    
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 8),
       child: Row(
@@ -543,10 +716,15 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
             setState(() {
               if (isSource) {
                 _sourceLang = lang;
+                // Nếu đang ở 1 chiều mà chọn ngôn ngữ cụ thể, vẫn giữ nguyên 1 chiều.
+                // Nếu đang ở 2 chiều mà chọn Tự động (mặc dù đã ẩn nhưng phòng hờ), thì ép về 1 chiều.
+                if (_isTwoWayMode && _sourceLang == 'Tự động') {
+                   _isTwoWayMode = false;
+                   widget.onModeChanged?.call(false);
+                }
               } else {
                 _targetLang = lang;
               }
-              widget.onModeChanged?.call(_sourceLang != 'Tự động');
               resetChat();
             });
           },
@@ -565,6 +743,38 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
   }
 
   Widget _buildMainTranslationArea() {
+    if (!_isTwoWayMode) {
+      // CHẾ ĐỘ 1 CHIỀU: Dùng 2 Panel song song nhưng logic khác
+      // Cột trái: Chỉ hiện văn bản Gốc
+      // Cột phải: Chỉ hiện văn bản Dịch
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 24),
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Expanded(flex: 5, child: _buildPanel(isLeft: true)),
+                const SizedBox(width: 20),
+                Expanded(flex: 5, child: _buildPanel(isLeft: false)),
+              ],
+            ),
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: const BoxDecoration(
+                color: Color(0xFF1F2937),
+                shape: BoxShape.circle,
+                boxShadow: [BoxShadow(color: Colors.black26, blurRadius: 4, offset: Offset(0, 2))],
+              ),
+              child: const Icon(Icons.arrow_forward, color: Colors.white, size: 20),
+            ),
+          ],
+        ),
+      );
+    }
+    
+    // CHẾ ĐỘ 2 CHIỀU: 2 Panel song song
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 24),
       child: Stack(
@@ -575,7 +785,7 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
             children: [
               Expanded(flex: 5, child: _buildPanel(isLeft: true)),
               const SizedBox(width: 20),
-              Expanded(flex: 4, child: _buildPanel(isLeft: false)),
+              Expanded(flex: 5, child: _buildPanel(isLeft: false)),
             ],
           ),
           Container(
@@ -585,7 +795,7 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
               shape: BoxShape.circle,
               boxShadow: [BoxShadow(color: Colors.black26, blurRadius: 4, offset: Offset(0, 2))],
             ),
-            child: const Icon(Icons.arrow_forward, color: Colors.white, size: 20),
+            child: const Icon(Icons.compare_arrows, color: Colors.white, size: 20),
           ),
         ],
       ),
@@ -613,6 +823,32 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
+          if (_isTwoWayMode)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              decoration: const BoxDecoration(
+                border: Border(bottom: BorderSide(color: borderColor)),
+              ),
+              child: Row(
+                children: [
+                  const Text('Nói', style: TextStyle(color: textLight, fontSize: 12, fontWeight: FontWeight.w600)),
+                  const SizedBox(width: 8),
+                  _buildDropdownButton(
+                    isLeft ? _sourceLang : _targetLang,
+                    isSource: isLeft, // Người 1 (trái) nói tiếng source, Người 2 (phải) nói tiếng target
+                    key: isLeft ? _leftSpeakBtnKey : _rightSpeakBtnKey,
+                  ),
+                  const Spacer(),
+                  const Text('Dịch', style: TextStyle(color: textLight, fontSize: 12, fontWeight: FontWeight.w600)),
+                  const SizedBox(width: 8),
+                  _buildDropdownButton(
+                    isLeft ? _targetLang : _sourceLang,
+                    isSource: !isLeft, // Người 1 (trái) dịch sang target, Người 2 (phải) dịch sang source
+                    key: isLeft ? _leftTransBtnKey : _rightTransBtnKey,
+                  ),
+                ],
+              ),
+            ),
           Expanded(
             child: Padding(
               padding: const EdgeInsets.all(24),
@@ -669,42 +905,128 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
   }
 
   Widget _buildSegmentsList({required bool isLeft}) {
-    final itemCount =
-        _segments.length + (isLeft ? (_liveSourceText.isNotEmpty ? 1 : 0) : (_liveTargetText.isNotEmpty ? 1 : 0));
-    return ListView.separated(
-      controller: isLeft ? _leftScrollController : _rightScrollController,
-      padding: EdgeInsets.zero,
-      itemCount: itemCount,
-      separatorBuilder: (context, index) => const SizedBox(height: 20),
-      itemBuilder: (context, index) {
-        if (index < _segments.length) {
-          final segment = _segments[index];
-          return GestureDetector(
-            onTap: () => _toggleSegmentSpeaker(index),
-            behavior: HitTestBehavior.opaque,
-            child: _buildSegmentItem(
-              text: isLeft ? segment.originalText : segment.translatedText,
-              speaker: segment.speakerId,
-              timestamp: segment.timestamp,
-              language: isLeft ? segment.sourceLanguage : segment.targetLanguage,
-              isLeft: isLeft,
-              speakerColor: segment.speakerColor,
-            ),
-          );
-        } else {
-          String sId = "Speaker ${_currentSpeakerId.toString().padLeft(2, '0')}";
-          return _buildSegmentItem(
-            text: isLeft ? _liveSourceText : _liveTargetText,
-            speaker: sId,
-            timestamp: "--:--",
-            language: isLeft ? _sourceLang : _targetLang,
-            isLeft: isLeft,
-            isLive: true,
-            speakerColor: _getSpeakerColor(sId),
-          );
-        }
-      },
-    );
+    if (!_isTwoWayMode) {
+      // CHẾ ĐỘ 1 CHIỀU: 
+      // Cột trái (isLeft = true) hiển thị toàn bộ văn bản GỐC (nhận diện).
+      // Cột phải (isLeft = false) hiển thị toàn bộ văn bản DỊCH.
+      final itemCount = _segments.length + ((_liveSourceText.isNotEmpty || _liveTargetText.isNotEmpty) ? 1 : 0);
+      return ListView.separated(
+        controller: isLeft ? _leftScrollController : _rightScrollController,
+        padding: EdgeInsets.zero,
+        itemCount: itemCount,
+        separatorBuilder: (context, index) => const SizedBox(height: 20),
+        itemBuilder: (context, index) {
+          if (index < _segments.length) {
+            final segment = _segments[index];
+            return GestureDetector(
+              onTap: () => _toggleSegmentSpeaker(index),
+              behavior: HitTestBehavior.opaque,
+              child: _buildSegmentItem(
+                text: isLeft ? segment.originalText : segment.translatedText,
+                speaker: "Người nói", // 1 chiều nên ẩn ID người dùng đi cho đỡ rối, hoặc ghi chung
+                timestamp: segment.timestamp,
+                language: isLeft ? segment.sourceLanguage : segment.targetLanguage,
+                isOriginal: isLeft, // Ở 1 chiều, cột trái luôn gốc (đen), cột phải luôn dịch (xanh)
+                speakerColor: const Color(0xFF94A3B8), // Màu trung tính
+              ),
+            );
+          } else {
+            return _buildSegmentItem(
+              text: isLeft ? _liveSourceText : _liveTargetText,
+              speaker: "Người nói",
+              timestamp: "--:--",
+              language: isLeft ? _sourceLang : _targetLang,
+              isOriginal: isLeft,
+              isLive: true,
+              speakerColor: const Color(0xFF94A3B8),
+            );
+          }
+        },
+      );
+    } else {
+      // CHẾ ĐỘ 2 CHIỀU:
+      // Lọc ra các segments thuộc về cột hiện tại
+      // isLeft = true -> Chỉ lấy Speaker 01
+      // isLeft = false -> Chỉ lấy Speaker 02
+      final filteredSegments = _segments.where((seg) {
+        if (isLeft) return seg.speakerId == "Speaker 01";
+        return seg.speakerId == "Speaker 02";
+      }).toList();
+
+      // Xác định xem có văn bản live (đang nói) phù hợp với cột hiện tại không
+      String sIdLive = "Speaker ${_currentSpeakerId.toString().padLeft(2, '0')}";
+      bool showLiveHere = isLeft ? (sIdLive == "Speaker 01") : (sIdLive == "Speaker 02");
+      bool hasLiveText = showLiveHere && (_liveSourceText.isNotEmpty || _liveTargetText.isNotEmpty);
+
+      final itemCount = filteredSegments.length + (hasLiveText ? 1 : 0);
+
+      return ListView.separated(
+        controller: isLeft ? _leftScrollController : _rightScrollController,
+        padding: EdgeInsets.zero,
+        itemCount: itemCount,
+        separatorBuilder: (context, index) => const SizedBox(height: 20),
+        itemBuilder: (context, index) {
+          if (index < filteredSegments.length) {
+            final segment = filteredSegments[index];
+            // Trong cùng 1 cột của 1 người: hiển thị 2 dòng (Dòng 1: Gốc, Dòng 2: Dịch)
+            return GestureDetector(
+              onTap: () => _toggleSegmentSpeaker(_segments.indexOf(segment)),
+              behavior: HitTestBehavior.opaque,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _buildSegmentItem(
+                    text: segment.originalText,
+                    speaker: segment.speakerId,
+                    timestamp: segment.timestamp,
+                    language: segment.sourceLanguage,
+                    isOriginal: true,
+                    speakerColor: segment.speakerColor,
+                  ),
+                  const SizedBox(height: 12),
+                  _buildSegmentItem(
+                    text: segment.translatedText,
+                    speaker: segment.speakerId,
+                    timestamp: segment.timestamp,
+                    language: segment.targetLanguage,
+                    isOriginal: false,
+                    speakerColor: segment.speakerColor,
+                  ),
+                  const SizedBox(height: 8),
+                  const Divider(color: Color(0xFFF3F4F6), thickness: 1.5),
+                ],
+              ),
+            );
+          } else {
+            // Hiển thị phần Live (đang nói)
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _buildSegmentItem(
+                  text: _liveSourceText,
+                  speaker: sIdLive,
+                  timestamp: "--:--",
+                  language: _sourceLang,
+                  isOriginal: true,
+                  isLive: true,
+                  speakerColor: _getSpeakerColor(sIdLive),
+                ),
+                const SizedBox(height: 12),
+                _buildSegmentItem(
+                  text: _liveTargetText,
+                  speaker: sIdLive,
+                  timestamp: "--:--",
+                  language: _targetLang,
+                  isOriginal: false,
+                  isLive: true,
+                  speakerColor: _getSpeakerColor(sIdLive),
+                ),
+              ],
+            );
+          }
+        },
+      );
+    }
   }
 
   Widget _buildSegmentItem({
@@ -712,11 +1034,14 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
     required String speaker,
     required String timestamp,
     required String language,
-    required bool isLeft,
+    required bool isOriginal,
     required Color speakerColor,
     bool isLive = false,
   }) {
-    final Color textColor = isLeft ? textDark : const Color(0xFFFF5722);
+    // Màu chữ phân biệt: 
+    // Văn bản gốc (nhận diện) -> textDark
+    // Văn bản dịch -> màu xanh dương (hoặc màu cam tuỳ bạn chọn, ở đây chọn blueAccent hoặc màu khác để nổi bật)
+    final Color textColor = isOriginal ? textDark : const Color(0xFF03A9F4);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -737,7 +1062,7 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
               Container(
                 width: 3,
                 margin: const EdgeInsets.only(left: 3, right: 12),
-                decoration: BoxDecoration(color: speakerColor.withOpacity(0.3), borderRadius: BorderRadius.circular(2)),
+                decoration: BoxDecoration(color: isOriginal ? speakerColor.withOpacity(0.3) : const Color(0xFF03A9F4).withOpacity(0.3), borderRadius: BorderRadius.circular(2)),
               ),
               Expanded(
                 child: Text(
@@ -746,7 +1071,7 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
                     fontSize: 16,
                     color: isLive ? textColor.withOpacity(0.5) : textColor,
                     height: 1.5,
-                    fontWeight: isLeft ? FontWeight.normal : FontWeight.w500,
+                    fontWeight: isOriginal ? FontWeight.normal : FontWeight.w500,
                   ),
                 ),
               ),
@@ -758,7 +1083,7 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
   }
 
   Widget _buildHowItWorks() {
-    final String modeText = _sourceLang == 'Tự động' ? 'một chiều' : '2 chiều';
+    final String modeText = !_isTwoWayMode ? 'một chiều' : '2 chiều';
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
@@ -774,8 +1099,8 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
         const SizedBox(height: 16),
         _buildHowItWorksStep(
           2,
-          _sourceLang == 'Tự động' ? 'Tự động nhận diện ngôn ngữ & người nói' : 'Dịch song phương',
-          _sourceLang == 'Tự động'
+          !_isTwoWayMode ? 'Tự động nhận diện ngôn ngữ & người nói' : 'Dịch song phương',
+          !_isTwoWayMode
               ? 'Nếu bạn nói ngôn ngữ khác ngôn ngữ đích, hệ thống sẽ tự động dịch. Nếu bạn nói cùng ngôn ngữ đích, văn bản sẽ được giữ nguyên.'
               : 'Nói bất kỳ ngôn ngữ nào trong hai ngôn ngữ đã chọn. Hệ thống sẽ tự động chuyển đổi ngôn ngữ đích.',
         ),
@@ -826,73 +1151,95 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
   }
 
   Widget _buildIdleActionBar() {
-    return Row(
-      children: [
-        _buildBottomIconButton(Icons.mic_none),
-        const Spacer(),
-        Material(
-          color: Colors.transparent,
-          child: InkWell(
-            onTap: _handleMicTap,
-            borderRadius: BorderRadius.circular(12),
-            child: AnimatedBuilder(
+    return Container(
+      decoration: BoxDecoration(
+        color: panelBg,
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(color: borderColor),
+        boxShadow: [
+          BoxShadow(color: Colors.black.withOpacity(0.02), blurRadius: 10, offset: const Offset(0, 2))
+        ],
+      ),
+      child: Row(
+        children: [
+          const SizedBox(width: 8),
+          Expanded(
+            child: TextField(
+              controller: _textController,
+              decoration: const InputDecoration(
+                hintText: 'Nhập văn bản để dịch hoặc bấm mic...',
+                border: InputBorder.none,
+                contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+              ),
+              onChanged: (text) => setState(() {}), // Gây render lại để hiển thị icon Gửi
+              onSubmitted: (_) => _handleTextSend(),
+            ),
+          ),
+          if (_textController.text.isNotEmpty || _isTranslatingText)
+             IconButton(
+               icon: _isTranslatingText 
+                  ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Icon(Icons.send, color: blueAccent),
+               onPressed: _isTranslatingText ? null : _handleTextSend,
+             )
+          else
+            AnimatedBuilder(
               animation: _btnAnimController,
               builder: (context, child) {
                 final Color speakerColor = _getSpeakerColor("Speaker ${_currentSpeakerId.toString().padLeft(2, '0')}");
                 final double offset = _btnAnimController.value;
-                return Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 48, vertical: 12),
-                  decoration: BoxDecoration(
-                    gradient: LinearGradient(
-                      begin: Alignment(offset * 2 - 1, -1),
-                      end: Alignment(offset * 2 + 1, 1),
-                      tileMode: TileMode.repeated,
-                      colors: [
-                        speakerColor,
-                        speakerColor.withOpacity(0.8),
-                        speakerColor.withOpacity(0.5),
-                        speakerColor.withOpacity(0.8),
-                        speakerColor,
-                      ],
-                      stops: const [0.0, 0.25, 0.5, 0.75, 1.0],
-                    ),
-                    borderRadius: BorderRadius.circular(12),
-                    boxShadow: [
-                      BoxShadow(color: speakerColor.withOpacity(0.3), blurRadius: 10, offset: const Offset(0, 4))
-                    ],
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      if (_isStarting)
-                        const SizedBox(
-                          width: 18,
-                          height: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2.5, color: Colors.white),
-                        )
-                      else
-                        const Icon(Icons.mic, color: Colors.white, size: 20),
-                      const SizedBox(width: 10),
-                      const Text(
-                        'Bắt đầu nói',
-                        style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16),
+                return Material(
+                  color: Colors.transparent,
+                  child: InkWell(
+                    onTap: _handleMicTap,
+                    borderRadius: BorderRadius.circular(24),
+                    child: Container(
+                      margin: const EdgeInsets.all(4),
+                      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment(offset * 2 - 1, -1),
+                          end: Alignment(offset * 2 + 1, 1),
+                          tileMode: TileMode.repeated,
+                          colors: [
+                            speakerColor,
+                            speakerColor.withOpacity(0.8),
+                            speakerColor.withOpacity(0.5),
+                            speakerColor.withOpacity(0.8),
+                            speakerColor,
+                          ],
+                          stops: const [0.0, 0.25, 0.5, 0.75, 1.0],
+                        ),
+                        borderRadius: BorderRadius.circular(20),
+                        boxShadow: [
+                          BoxShadow(color: speakerColor.withOpacity(0.3), blurRadius: 10, offset: const Offset(0, 4))
+                        ],
                       ),
-                    ],
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          if (_isStarting)
+                            const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2.5, color: Colors.white),
+                            )
+                          else
+                            const Icon(Icons.mic, color: Colors.white, size: 20),
+                          const SizedBox(width: 8),
+                          const Text(
+                            'Nói',
+                            style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 15),
+                          ),
+                        ],
+                      ),
+                    ),
                   ),
                 );
               },
             ),
-          ),
-        ),
-        const Spacer(),
-        Row(
-          children: [
-            _buildBottomIconButton(Icons.keyboard_alt_outlined),
-            const SizedBox(width: 12),
-            _buildBottomIconButton(Icons.fullscreen),
-          ],
-        ),
-      ],
+        ],
+      ),
     );
   }
 
@@ -1051,17 +1398,22 @@ class _LanguagePickerDialogState extends State<LanguagePickerDialog> {
     widget.suggestedLanguages.where((l) => l.toLowerCase().contains(_searchQuery.toLowerCase())).toList();
     List<String> filteredAll =
     widget.allLanguages.where((l) => l.toLowerCase().contains(_searchQuery.toLowerCase())).toList();
+    
+    double screenWidth = MediaQuery.of(context).size.width;
     double top = widget.spawnPosition.dy + widget.buttonSize.height + 6;
-    double? left = widget.isSource ? widget.spawnPosition.dx : null;
-    double? right = widget.isSource
-        ? null
-        : (MediaQuery.of(context).size.width - widget.spawnPosition.dx - widget.buttonSize.width);
+    
+    // Đảm bảo Dialog không bị tràn lề phải màn hình
+    double dialogWidth = 250.0;
+    double left = widget.spawnPosition.dx;
+    if (left + dialogWidth > screenWidth - 16) {
+       left = screenWidth - dialogWidth - 16; 
+    }
+    
     return Stack(
       children: [
         Positioned(
           top: top,
           left: left,
-          right: right,
           child: Material(
             color: Colors.transparent,
             child: Container(
@@ -1098,8 +1450,6 @@ class _LanguagePickerDialogState extends State<LanguagePickerDialog> {
                       padding: const EdgeInsets.only(bottom: 8),
                       physics: const BouncingScrollPhysics(),
                       children: [
-                        if (widget.isSource && _searchQuery.isEmpty)
-                          _buildLanguageItem('Tự động', isSelected: widget.currentLanguage == 'Tự động'),
                         if (filteredSuggested.isNotEmpty) ...[
                           const Padding(
                             padding: EdgeInsets.fromLTRB(16, 12, 16, 6),

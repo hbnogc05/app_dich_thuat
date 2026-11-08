@@ -1127,8 +1127,9 @@ Bạn là Chuyên gia Khôi phục Ngữ âm Song ngữ (Bilingual Phonetic ASR 
 
 1. THÔNG TIN NGỮ CẢNH:
 - Bối cảnh chủ đề: $meetingContext
-- Ngôn ngữ đích người dùng muốn nhận (`targetLanguage`): "$targetLanguage"
-- Chế độ thu âm: ${_isAutoDetectSource ? "TỰ ĐỘNG NHẬN DẠNG NGÔN NGỮ (Auto-detect)" : "Dịch 2 chiều"}
+- Ngôn ngữ đích (Target Language): "$targetLanguage"
+- Ngôn ngữ nguồn hiện tại của Micro (Source Language): "${_originalSourceLangName}"
+- Chế độ thu âm: ${_isAutoDetectSource ? "TỰ ĐỘNG NHẬN DẠNG NGÔN NGỮ (Auto-detect)" : "Dịch 2 chiều cứng"}
 - Từ điển chuyên ngành bắt buộc: $glossaryFormatted
 - Lịch sử các câu vừa nói trước đó:
 $historyFormatted
@@ -1139,16 +1140,18 @@ $historyFormatted
 $alternatesFormatted
 
 3. QUY TẮC XỬ LÝ BẮT BUỘC:
-- TRƯỜNG HỢP 1 (NGƯỜI NÓI ĐANG NÓI TIẾNG VIỆT / CÙNG NGÔN NGỮ ĐÍCH "$targetLanguage"):
-  Nếu chuỗi đầu vào là câu tiếng Việt có nghĩa (hoặc là câu tiếng Việt bị bộ thu âm nghe nhầm sang các từ tiếng Anh đồng âm vô nghĩa về mặt ngữ cảnh như "I want to wait time", "Dollar General"), hãy khôi phục lại đúng câu tiếng Việt gốc vào `reconstructed_source`, đặt `detected_lang` là "Việt", và GIỮ NGUYÊN hoàn toàn câu tiếng Việt đó ở `translated_text` (tuyệt đối không dịch sang ngôn ngữ khác).
-- TRƯỜNG HỢP 2 (NGƯỜI NÓI ĐANG NÓI TIẾNG ANH / NGÔN NGỮ KHÁC VỚI "$targetLanguage"):
-  Nếu người nói đang phát âm tiếng Anh (kể cả khi bộ thu âm `vi-VN` phiên âm một vài từ tiếng Anh sang chữ tiếng Việt đồng âm, hoặc người nói nói nhanh bị nuốt âm), hãy khôi phục lại câu tiếng Anh chuẩn xác vào `reconstructed_source`, đặt `detected_lang` là "Anh", và DỊCH câu đó sang "$targetLanguage" một cách tự nhiên, chuẩn xác ở `translated_text`.
+- BƯỚC 1: XÁC ĐỊNH NGÔN NGỮ GỐC. 
+  + Mặc định hãy coi đầu vào đang được nói bằng Ngôn ngữ nguồn ("${_originalSourceLangName}"). 
+  + Trừ khi đó rõ ràng là một câu của ngôn ngữ khác bị nghe nhầm.
+- BƯỚC 2: KHÔI PHỤC VĂN BẢN (reconstructed_source). Khôi phục lại đúng văn bản gốc dựa trên âm thanh của chữ ASR.
+- BƯỚC 3: DỊCH THUẬT BẮT BUỘC (translated_text). 
+  + Hãy DỊCH CÂU VỪA KHÔI PHỤC SANG NGÔN NGỮ ĐÍCH ("$targetLanguage") một cách tự nhiên và chuẩn xác.
+  + CHỈ giữ nguyên (không dịch) KHI VÀ CHỈ KHI ngôn ngữ gốc thực sự trùng khớp hoàn toàn 100% với ngôn ngữ đích.
 
 4. ĐỊNH DẠNG ĐẦU RA:
 Chỉ trả về duy nhất 1 đối tượng JSON hợp lệ có đúng 3 trường sau:
-{"reconstructed_source": "câu gốc đã khôi phục", "translated_text": "bản dịch sang $targetLanguage (hoặc giữ nguyên nếu câu gốc đã là $targetLanguage)", "detected_lang": "Việt hoặc Anh"}
+{"reconstructed_source": "câu gốc đã khôi phục", "translated_text": "bản dịch sang $targetLanguage", "detected_lang": "tên ngôn ngữ gốc"}
 ''';
-
       final url = Uri.parse(
         'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$activeKey',
       );
