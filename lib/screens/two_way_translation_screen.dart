@@ -28,18 +28,20 @@ class TranslationSegment {
 }
 
 class TwoWayTranslationScreen extends StatefulWidget {
-  final Function(String)? onHistoryAdded;
   final VoidCallback? onBack;
   final VoidCallback? onNewChat;
   final VoidCallback? onViewHistory;
-  final Function(String)? onLoadFromHistory;
   final Function(bool isTwoWay)? onModeChanged;
-  final List<String> historyItems;
+  
+  // Dành cho tương thích lịch sử ở phiên bản cũ (nếu cần, nhưng nay ta dùng ConversationRecord ở ngoài)
+  final Function(dynamic)? onHistoryAdded;
+  final Function(dynamic)? onLoadFromHistory;
+  final List<dynamic> historyItems;
 
   const TwoWayTranslationScreen({
     super.key,
-    this.onHistoryAdded,
     this.onBack,
+    this.onHistoryAdded,
     this.onNewChat,
     this.onViewHistory,
     this.onLoadFromHistory,
@@ -156,6 +158,7 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
   bool _isTwoWayMode = false;
 
   String get currentConversationSummary => _segments.isNotEmpty ? _segments.last.originalText : "";
+  List<TranslationSegment> get currentSegments => List.unmodifiable(_segments);
 
   void forceOneWayMode() {
     if (!mounted) return;
@@ -1075,6 +1078,16 @@ class TwoWayTranslationScreenState extends State<TwoWayTranslationScreen> with T
                   ),
                 ),
               ),
+              if (!isLive)
+                IconButton(
+                  icon: const Icon(Icons.volume_up, size: 18, color: textLight),
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(),
+                  onPressed: () async {
+                    await _gotransEngine.speakNative(text, targetLanguage: language);
+                  },
+                  tooltip: 'Đọc',
+                ),
             ],
           ),
         ),

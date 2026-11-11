@@ -111,4 +111,30 @@ class GeminiService {
       return 'Lỗi tóm tắt: ${errorMsg.length > 50 ? errorMsg.substring(0, 50) + "..." : errorMsg}';
     }
   }
+
+  /// Đặt tên chủ đề ngắn gọn cho cuộc hội thoại
+  Future<String> generateTopicName(String conversationText) async {
+    if (conversationText.trim().isEmpty) return 'Cuộc hội thoại trống';
+    if (!_isConfigured) return 'Hội thoại chưa đặt tên';
+
+    final prompt = '''
+    Bạn là một trợ lý AI. Hãy đọc cuộc hội thoại dưới đây và đặt MỘT TÊN CHỦ ĐỀ thật ngắn gọn (tối đa 6-8 từ, không dùng dấu ngoặc kép, không giải thích thêm).
+    
+    Cuộc hội thoại:
+    $conversationText
+    ''';
+
+    try {
+      final content = [Content.text(prompt)];
+      final response = await _model.generateContent(content);
+      final result = response.text?.trim() ?? '';
+      
+      if (result.isEmpty) return 'Chủ đề hội thoại';
+      // Xóa dấu ngoặc kép nếu AI vô tình thêm vào
+      return result.replaceAll('"', '').replaceAll("'", "");
+    } catch (e) {
+      debugPrint('Gemini Topic Error: $e');
+      return 'Hội thoại chưa đặt tên';
+    }
+  }
 }
